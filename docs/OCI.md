@@ -10,7 +10,8 @@ the paths that `prefetch` holds don't count towards the limit. `prefetch`
 itself lists only store paths.
 
 The feature is off unless `closureRegistries` lists a registry, and
-`storePaths` volumes work as before.
+`storePaths` volumes work as before. `nix-store-csi push` writes the
+artifacts from the caches the plugin already uses.
 
 ## Why
 
@@ -83,8 +84,8 @@ the roots, which get the `.roots/` links:
 Each **layer** is the path's NAR, as a cache stores it. Its media type is
 `application/vnd.nix-store-csi.nar.v1` for a NAR without compression, and
 adds the compression's narinfo name otherwise: `+xz`, `+zstd`, `+bzip2`,
-`+gzip` or `+br`, so a producer can copy a cache's NAR files byte for byte.
-The annotations carry the rest of the narinfo:
+`+gzip` or `+br`. So `push` copies a cache's NAR files byte for byte. The
+annotations carry the rest of the narinfo:
 
 | Annotation | Value |
 |---|---|
@@ -148,3 +149,17 @@ it for every request, sends its login for the registry's host, and answers a
 service, as Docker does. A repository that needs no login works without the
 Secret, and so do public repositories that ask for an anonymous token, like
 those on ghcr.io.
+
+## Pushing
+
+```sh
+nix-store-csi push oci://registry.example.com/envs/web:v1 \
+  x86_64-linux=/nix/store/<hash>-web aarch64-linux=/nix/store/<hash>-web
+```
+
+`push` resolves each closure from `--substituters` as the plugin does, so
+each path needs a trusted signature. It uploads each NAR file that the
+registry hasn't got, checks it against its `NarHash` first, and puts the
+config and the manifest, plus an index for more than one system. It prints
+the reference with the digest. The login comes from Docker's config, or
+`--registry-credentials`.

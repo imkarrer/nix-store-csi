@@ -35,6 +35,8 @@
   Docker config with logins for registries.
 - The chart's `extraCACertificates`, a ConfigMap of CA certificates that the
   plugin trusts besides the image's.
+- `nix-store-csi push` puts the closures of store paths from the caches in a
+  registry, with an index for several systems, and prints the reference.
 - `unpack` takes an `oci://` reference.
 
 ## 0.1.7 - 2026-10-21

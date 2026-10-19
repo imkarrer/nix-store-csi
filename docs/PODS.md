@@ -102,8 +102,15 @@ own, and the manifests once the nodes hold it, as in
 ## Closures from a registry
 
 If the chart's `closureRegistries` lists a registry, a volume can name a
-closure there by digest, in place of `storePaths`. The closure is an OCI
-artifact in the format that [OCI.md](OCI.md) describes:
+closure there by digest, in place of `storePaths`. `nix-store-csi push` puts
+the closure in the registry, as [OCI.md](OCI.md) describes, and prints the
+reference:
+
+```sh
+nix-store-csi push oci://registry.example.com/envs/hello:v1 \
+  x86_64-linux=/nix/store/5z2yp3ysx8476c8g5w25b0smlgkjvaq3-hello-2.12.3 \
+  aarch64-linux=/nix/store/0xy6jlccm8kfpwmhkxabz3638lchyi74-hello-2.12.3
+```
 
 ```yaml
 args: [/nix/store/.roots/hello-2.12.3/bin/hello]

@@ -9,6 +9,7 @@ Usage: nix-store-csi [OPTIONS] <COMMAND>
 Commands:
   csi     Serve the CSI node plugin on a unix socket
   unpack  Fetch the closures of store paths into the node store and print its directory, for use with `podman -v DIR:/nix/store:ro`
+  push    Push the closures of store paths from the caches to a registry, as an artifact for `closure` volumes, and print the reference that pins it
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -18,7 +19,7 @@ Options:
       --netrc-file <FILE>            Netrc file with credentials for caches, read on every request [env: NIX_STORE_CSI_NETRC_FILE=]
       --insecure-registries <HOSTS>  OCI registry hosts, like `registry.local` or `registry.local:5000`, to reach over plain HTTP instead of HTTPS [env: NIX_STORE_CSI_INSECURE_REGISTRIES=]
       --closure-registries <LIST>    Registries that `closure` volumes may name, as `host[:port]`, or `host[:port]/<prefix>` for the repositories under a prefix. Empty turns `closure` volumes off [env: NIX_STORE_CSI_CLOSURE_REGISTRIES=]
-      --registry-credentials <FILE>  Docker config file with logins for registries, like the `.dockerconfigjson` of an image pull Secret, read on every request [env: NIX_STORE_CSI_REGISTRY_CREDENTIALS=]
+      --registry-credentials <FILE>  Docker config file with logins for registries, like the `.dockerconfigjson` of an image pull Secret, read on every request. `push` defaults to Docker's own [env: NIX_STORE_CSI_REGISTRY_CREDENTIALS=]
       --state-dir <DIR>              Directory that holds the node store in `store/` [env: NIX_STORE_CSI_STATE_DIR=] [default: /var/lib/nix-store-csi]
       --log-level <LEVEL>            off, error, warn, info, debug or trace [env: NIX_STORE_CSI_LOG_LEVEL=] [default: info]
       --log-format <FORMAT>          text or json [env: NIX_STORE_CSI_LOG_FORMAT=] [default: text] [possible values: text, json]
@@ -49,7 +50,7 @@ Options:
       --closure-registries <LIST>    Registries that `closure` volumes may name, as `host[:port]`, or `host[:port]/<prefix>` for the repositories under a prefix. Empty turns `closure` volumes off [env: NIX_STORE_CSI_CLOSURE_REGISTRIES=]
       --metrics-address <ADDRESS>    Serve Prometheus metrics at `/metrics` on ADDRESS, like `[::]:9809`. Off unless set [env: NIX_STORE_CSI_METRICS_ADDRESS=]
       --max-closure-size <SIZE>      Refuse a volume whose closure's NARs add up to more than SIZE, like `20G`, before fetching any of it. Prefetched closures don't count. Off unless set [env: NIX_STORE_CSI_MAX_CLOSURE_SIZE=]
-      --registry-credentials <FILE>  Docker config file with logins for registries, like the `.dockerconfigjson` of an image pull Secret, read on every request [env: NIX_STORE_CSI_REGISTRY_CREDENTIALS=]
+      --registry-credentials <FILE>  Docker config file with logins for registries, like the `.dockerconfigjson` of an image pull Secret, read on every request. `push` defaults to Docker's own [env: NIX_STORE_CSI_REGISTRY_CREDENTIALS=]
       --prefetch-dir <DIR>           Keep the closures of the store paths listed in DIR fetched, even when `--ensure-free` needs the space. DIR, such as a mounted `ConfigMap`, holds a file for each volume attribute, `storePaths` or `storePaths.<system>`, and may hold a `revision` file, which the `prefetched` metric reports. The plugin reads it when it changes and every minute. Off unless set [env: NIX_STORE_CSI_PREFETCH_DIR=]
       --state-dir <DIR>              Directory that holds the node store in `store/` [env: NIX_STORE_CSI_STATE_DIR=] [default: /var/lib/nix-store-csi]
       --log-level <LEVEL>            off, error, warn, info, debug or trace [env: NIX_STORE_CSI_LOG_LEVEL=] [default: info]
@@ -77,7 +78,34 @@ Options:
       --netrc-file <FILE>            Netrc file with credentials for caches, read on every request [env: NIX_STORE_CSI_NETRC_FILE=]
       --insecure-registries <HOSTS>  OCI registry hosts, like `registry.local` or `registry.local:5000`, to reach over plain HTTP instead of HTTPS [env: NIX_STORE_CSI_INSECURE_REGISTRIES=]
       --closure-registries <LIST>    Registries that `closure` volumes may name, as `host[:port]`, or `host[:port]/<prefix>` for the repositories under a prefix. Empty turns `closure` volumes off [env: NIX_STORE_CSI_CLOSURE_REGISTRIES=]
-      --registry-credentials <FILE>  Docker config file with logins for registries, like the `.dockerconfigjson` of an image pull Secret, read on every request [env: NIX_STORE_CSI_REGISTRY_CREDENTIALS=]
+      --registry-credentials <FILE>  Docker config file with logins for registries, like the `.dockerconfigjson` of an image pull Secret, read on every request. `push` defaults to Docker's own [env: NIX_STORE_CSI_REGISTRY_CREDENTIALS=]
+      --state-dir <DIR>              Directory that holds the node store in `store/` [env: NIX_STORE_CSI_STATE_DIR=] [default: /var/lib/nix-store-csi]
+      --log-level <LEVEL>            off, error, warn, info, debug or trace [env: NIX_STORE_CSI_LOG_LEVEL=] [default: info]
+      --log-format <FORMAT>          text or json [env: NIX_STORE_CSI_LOG_FORMAT=] [default: text] [possible values: text, json]
+      --max-substitution-jobs <N>    NARs to fetch at once [env: NIX_STORE_CSI_MAX_SUBSTITUTION_JOBS=] [default: 16]
+  -h, --help                         Print help
+```
+
+## `push`
+
+```console
+$ nix-store-csi push --help
+Push the closures of store paths from the caches to a registry, as an artifact for `closure` volumes, and print the reference that pins it
+
+Usage: nix-store-csi push [OPTIONS] <TARGET> <STORE_PATH>...
+
+Arguments:
+  <TARGET>         `oci://<host>/<name>`, with an optional `:<tag>`
+  <STORE_PATH>...  Store paths for this machine's system, or `<system>=<store path>` for others. Several systems get an index
+
+Options:
+      --substituters <URLS>          Binary caches [env: NIX_STORE_CSI_SUBSTITUTERS=] [default: https://cache.nixos.org]
+      --trusted-public-keys <KEYS>   Keys that narinfos must be signed by [env: NIX_STORE_CSI_TRUSTED_PUBLIC_KEYS=] [default: cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=]
+      --no-require-sigs              Accept narinfos without a trusted signature [env: NIX_STORE_CSI_NO_REQUIRE_SIGS=]
+      --netrc-file <FILE>            Netrc file with credentials for caches, read on every request [env: NIX_STORE_CSI_NETRC_FILE=]
+      --insecure-registries <HOSTS>  OCI registry hosts, like `registry.local` or `registry.local:5000`, to reach over plain HTTP instead of HTTPS [env: NIX_STORE_CSI_INSECURE_REGISTRIES=]
+      --closure-registries <LIST>    Registries that `closure` volumes may name, as `host[:port]`, or `host[:port]/<prefix>` for the repositories under a prefix. Empty turns `closure` volumes off [env: NIX_STORE_CSI_CLOSURE_REGISTRIES=]
+      --registry-credentials <FILE>  Docker config file with logins for registries, like the `.dockerconfigjson` of an image pull Secret, read on every request. `push` defaults to Docker's own [env: NIX_STORE_CSI_REGISTRY_CREDENTIALS=]
       --state-dir <DIR>              Directory that holds the node store in `store/` [env: NIX_STORE_CSI_STATE_DIR=] [default: /var/lib/nix-store-csi]
       --log-level <LEVEL>            off, error, warn, info, debug or trace [env: NIX_STORE_CSI_LOG_LEVEL=] [default: info]
       --log-format <FORMAT>          text or json [env: NIX_STORE_CSI_LOG_FORMAT=] [default: text] [possible values: text, json]
