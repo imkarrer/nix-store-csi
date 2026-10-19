@@ -96,6 +96,28 @@ The derivation's `prefetch` output is a values file with the chart's
 own, and the manifests once the nodes hold it, as in
 [Prefetching](DEPLOY.md#prefetching).
 
+## Closures from a registry
+
+If the chart's `closureRegistries` lists a registry, a volume can name a
+closure there by digest, in place of `storePaths`. The closure is an OCI
+artifact in the format that [OCI.md](OCI.md) describes:
+
+```yaml
+args: [/nix/store/.roots/hello-2.12.3/bin/hello]
+# ...
+volumeAttributes:
+  closure: oci://registry.example.com/envs/hello:v1@sha256:<digest>
+```
+
+- The reference needs the digest. The tag before it is optional, and only
+  tells tools like Renovate which tag to follow.
+- With several systems the reference names an index, and each node takes the
+  manifest for its system, so one attribute serves every architecture.
+  `closure.<system>` works like `storePaths.<system>`.
+- A volume has either `storePaths` or `closure` attributes, not both.
+- The NARs come from the registry, and each store path still needs a
+  signature by a key in `trustedPublicKeys`.
+
 ## Multiple programs on `PATH`
 
 List one
