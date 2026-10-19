@@ -331,7 +331,7 @@ fn store_paths<'a>(
     context: &'a HashMap<String, String>,
     system: &str,
 ) -> Result<(String, &'a str), Status> {
-    store_path::for_system(context, system).ok_or_else(|| {
+    store_path::for_system(context, STORE_PATHS, system).ok_or_else(|| {
         Status::invalid_argument(format!(
             "no {STORE_PATHS}.{system} or {STORE_PATHS} attribute"
         ))

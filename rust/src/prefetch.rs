@@ -141,7 +141,9 @@ impl Prefetch {
             return Ok(None);
         };
         let revision = files.get(REVISION).map_or("", |r| r.trim()).to_owned();
-        let Some((name, list)) = store_path::for_system(&files, &self.system) else {
+        let Some((name, list)) =
+            store_path::for_system(&files, store_path::STORE_PATHS, &self.system)
+        else {
             return Ok(Some((revision, Vec::new())));
         };
         let mut roots = (self.store.roots(list.split_whitespace()))
