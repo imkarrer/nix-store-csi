@@ -1,10 +1,13 @@
-//! Tokens from a registry's token service, which registries ask for even for
-//! public repositories.
+//! Credentials for registries, from a Docker config file like the one in a
+//! `kubernetes.io/dockerconfigjson` Secret, and tokens from a registry's
+//! token service.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, bail, ensure};
+use base64::Engine;
 use serde::Deserialize;
 use url::Url;
 
@@ -15,7 +18,10 @@ const MAX_TOKEN: usize = 1 << 20;
 
 /// The credentials for one repository.
 pub struct Credentials {
-    /// `host` or `host:port`.
+    /// A Docker config file. Each request reads it, so an updated Secret takes
+    /// effect immediately.
+    file: Option<PathBuf>,
+    /// `host` or `host:port`, the key in the file.
     host: String,
     /// What the token service grants, like `repository:<name>:pull`.
     scope: String,
@@ -23,6 +29,20 @@ pub struct Credentials {
     token: Mutex<Option<String>>,
     /// Hosts whose token service may be plain HTTP.
     insecure: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct DockerConfig {
+    #[serde(default)]
+    auths: HashMap<String, DockerAuth>,
+}
+
+#[derive(Deserialize)]
+struct DockerAuth {
+    /// Base64 of `<username>:<password>`.
+    auth: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 /// What a token service answers. Docker's registry names the token `token`,
@@ -34,8 +54,9 @@ struct TokenAnswer {
 }
 
 impl Credentials {
-    pub fn new(host: &str, scope: String, insecure: Vec<String>) -> Self {
+    pub fn new(file: Option<PathBuf>, host: &str, scope: String, insecure: Vec<String>) -> Self {
         Self {
+            file,
             host: host.to_owned(),
             scope,
             token: Mutex::default(),
@@ -43,30 +64,47 @@ impl Credentials {
         }
     }
 
-    /// Adds the token to a request for `url`. A request to another host, like
-    /// a redirect to blob storage, doesn't get it.
+    /// Adds the token, or else the login for the host, to a request for
+    /// `url`. A request to another host, like a redirect to blob storage,
+    /// gets neither.
     pub fn authorize(
         &self,
         request: reqwest::RequestBuilder,
         url: &Url,
-    ) -> reqwest::RequestBuilder {
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
         if authority(url) != self.host {
-            return request;
+            return Ok(request);
         }
-        match &*self.token.lock().unwrap() {
-            Some(token) => request.bearer_auth(token),
+        if let Some(token) = &*self.token.lock().unwrap() {
+            return Ok(request.bearer_auth(token));
+        }
+        Ok(match self.login()? {
+            Some((user, password)) => request.basic_auth(user, Some(password)),
             None => request,
+        })
+    }
+
+    /// The user and password for the host in the file, if any.
+    fn login(&self) -> anyhow::Result<Option<(String, String)>> {
+        match &self.file {
+            Some(file) => login(file, &self.host),
+            None => Ok(None),
         }
     }
 
-    /// Answers a 401's `WWW-Authenticate`. For `Bearer`, it gets an anonymous
-    /// token from the service the challenge names, and requests use it from
-    /// then on.
+    /// Answers a 401's `WWW-Authenticate`. For `Bearer`, it gets a token from
+    /// the service the challenge names, with the login if there is one, and
+    /// requests use it from then on. `Basic` asks for a login, which a
+    /// request already sends if there is one.
     pub async fn answer(&self, challenge: &str) -> anyhow::Result<()> {
         let (scheme, params) = parse_challenge(challenge)
             .with_context(|| format!("unsupported WWW-Authenticate {challenge:?}"))?;
+        let login = self.login()?;
         if scheme.eq_ignore_ascii_case("basic") {
-            bail!("the registry wants a login for {}", self.host);
+            match login {
+                Some(_) => bail!("the registry refused the login for {}", self.host),
+                None => bail!("the registry wants a login for {}", self.host),
+            }
         }
         ensure!(
             scheme.eq_ignore_ascii_case("bearer"),
@@ -92,11 +130,17 @@ impl Credentials {
             // an upload.
             query.append_pair("scope", params.get("scope").unwrap_or(&self.scope));
         }
-        let request = transport::client()?.get(url.clone());
+        let mut request = transport::client()?.get(url.clone());
+        if let Some((user, password)) = &login {
+            request = request.basic_auth(user, Some(password));
+        }
         let resp = request.send().await.map_err(reqwest::Error::without_url)?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            bail!("the token service wants a login for {}", self.host);
+            match login {
+                Some(_) => bail!("the token service refused the login for {}", self.host),
+                None => bail!("the token service wants a login for {}", self.host),
+            }
         }
         ensure!(status.is_success(), "the token service answered {status}");
         let body = resp.bytes().await.map_err(reqwest::Error::without_url)?;
@@ -120,6 +164,39 @@ fn authority(url: &Url) -> String {
         Some(port) => format!("{host}:{port}"),
         None => host.to_owned(),
     }
+}
+
+/// The login for `host` in the Docker config `file`. The file's keys may be
+/// URLs, like Docker Hub's `https://index.docker.io/v1/`. Errors don't quote
+/// the file, which holds passwords.
+pub fn login(file: &Path, host: &str) -> anyhow::Result<Option<(String, String)>> {
+    let text = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    let config: DockerConfig = serde_json::from_slice(&text)
+        .map_err(|_| anyhow::anyhow!("{} is not a Docker config", file.display()))?;
+    let hub = |h: &str| matches!(h, "docker.io" | "index.docker.io" | "registry-1.docker.io");
+    let entry = (config.auths.iter()).find(|(key, _)| {
+        let key = key
+            .strip_prefix("https://")
+            .or(key.strip_prefix("http://"))
+            .unwrap_or(key);
+        let key = key.split('/').next().unwrap_or_default();
+        key.eq_ignore_ascii_case(host) || (hub(key) && hub(host))
+    });
+    let Some((_, auth)) = entry else {
+        return Ok(None);
+    };
+    if let (Some(user), Some(password)) = (&auth.username, &auth.password) {
+        return Ok(Some((user.clone(), password.clone())));
+    }
+    let Some(encoded) = &auth.auth else {
+        return Ok(None);
+    };
+    let bad = || anyhow::anyhow!("{} has a bad auth for {host}", file.display());
+    let decoded =
+        (base64::engine::general_purpose::STANDARD.decode(encoded.trim())).map_err(|_| bad())?;
+    let decoded = String::from_utf8(decoded).map_err(|_| bad())?;
+    let (user, password) = decoded.split_once(':').ok_or_else(bad)?;
+    Ok(Some((user.to_owned(), password.to_owned())))
 }
 
 /// The scheme and parameters of a challenge, like
@@ -167,6 +244,48 @@ mod tests {
         assert_eq!(
             (scheme.as_str(), params["realm"].as_str()),
             ("Basic", "Registry Realm")
+        );
+    }
+
+    #[test]
+    fn reads_docker_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.json");
+        let auth = base64::engine::general_purpose::STANDARD.encode("ann:s3cret:x");
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"auths": {{
+                    "registry.local:5000": {{"auth": "{auth}"}},
+                    "https://index.docker.io/v1/": {{"username": "bob", "password": "pw"}},
+                    "https://other.example/v2/": {{"auth": "{auth}"}},
+                    "broken.example": {{"auth": "%%%"}}
+                }}, "credsStore": "desktop"}}"#
+            ),
+        )
+        .unwrap();
+        let login = |host| login(&file, host).map(|l| l.map(|(u, p)| format!("{u}:{p}")));
+        // The password may hold a colon.
+        assert_eq!(
+            login("registry.local:5000").unwrap().unwrap(),
+            "ann:s3cret:x"
+        );
+        assert_eq!(
+            login("REGISTRY.local:5000").unwrap().unwrap(),
+            "ann:s3cret:x"
+        );
+        assert_eq!(login("registry.local").unwrap(), None);
+        assert_eq!(login("registry-1.docker.io").unwrap().unwrap(), "bob:pw");
+        assert_eq!(login("other.example").unwrap().unwrap(), "ann:s3cret:x");
+        let e = format!("{:#}", login("broken.example").unwrap_err());
+        assert!(e.contains("bad auth for broken.example"), "{e}");
+
+        // An error doesn't quote the file.
+        std::fs::write(&file, r#"{"auths": {"x": {"auth": "s3cret""#).unwrap();
+        let e = format!("{:#}", login("x").unwrap_err());
+        assert!(
+            e.contains("is not a Docker config") && !e.contains("s3cret"),
+            "{e}"
         );
     }
 }

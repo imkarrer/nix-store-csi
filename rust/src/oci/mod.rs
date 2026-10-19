@@ -9,6 +9,7 @@ pub(crate) mod test_registry;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
@@ -69,6 +70,8 @@ pub struct Registries {
     allowed: Vec<String>,
     /// Hosts, with or without a port, that serve plain HTTP.
     insecure: Vec<String>,
+    /// A Docker config file with logins.
+    credentials: Option<PathBuf>,
 }
 
 /// A repository that NARs come from.
@@ -211,8 +214,12 @@ fn parts(reference: &str) -> anyhow::Result<Parts<'_>> {
 }
 
 impl Registries {
-    pub fn new(allowed: Vec<String>, insecure: Vec<String>) -> Self {
-        Self { allowed, insecure }
+    pub fn new(allowed: Vec<String>, insecure: Vec<String>, credentials: Option<PathBuf>) -> Self {
+        Self {
+            allowed,
+            insecure,
+            credentials,
+        }
     }
 
     fn insecure(&self, host: &str) -> bool {
@@ -234,6 +241,7 @@ impl Registries {
 
     fn repository(&self, host: &str, name: &str, base: &Url) -> anyhow::Result<Repository> {
         let credentials = Arc::new(Credentials::new(
+            self.credentials.clone(),
             host,
             format!("repository:{name}:pull"),
             self.insecure.clone(),
@@ -626,7 +634,9 @@ pub(crate) mod tests {
     use serde_json::{Value, json};
     use tokio::io::AsyncReadExt;
 
-    use super::test_registry::{Login, Registry};
+    use std::path::Path;
+
+    use super::test_registry::{Login, PASSWORD, Registry, USER};
     use super::*;
     use crate::narinfo::tests::{file_nar, sign};
 
@@ -857,7 +867,28 @@ pub(crate) mod tests {
 
     /// Registries that allow `registry`, over plain HTTP.
     pub fn registries(registry: &Registry) -> Registries {
-        Registries::new(vec![registry.host.clone()], vec!["127.0.0.1".to_owned()])
+        logged_in(registry, None)
+    }
+
+    /// Like [`registries`], with the logins in `credentials`.
+    pub fn logged_in(registry: &Registry, credentials: Option<&Path>) -> Registries {
+        Registries::new(
+            vec![registry.host.clone()],
+            vec!["127.0.0.1".to_owned()],
+            credentials.map(Path::to_owned),
+        )
+    }
+
+    /// A Docker config with `password` for `registry`.
+    pub fn login(dir: &Path, registry: &Registry, password: &str) -> PathBuf {
+        let file = dir.join("config.json");
+        let auth = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{USER}:{password}"),
+        );
+        let config = json!({ "auths": { registry.host.clone(): { "auth": auth } } });
+        std::fs::write(&file, config.to_string()).unwrap();
+        file
     }
 
     async fn fetch(
@@ -888,6 +919,7 @@ pub(crate) mod tests {
                 "other:5000".into(),
             ],
             vec!["registry.local".into(), "other:5000".into()],
+            None,
         );
         let r = registries
             .parse(&format!("oci://ghcr.io/org/envs/web@{d}"))
@@ -914,7 +946,7 @@ pub(crate) mod tests {
             let r = registries.parse(&format!("oci://{host}/env@{d}")).unwrap();
             assert_eq!(r.base.scheme(), scheme, "{host}");
         }
-        let anywhere = Registries::new(vec!["other".into()], vec!["other:5000".into()]);
+        let anywhere = Registries::new(vec!["other".into()], vec!["other:5000".into()], None);
         let r = anywhere.parse(&format!("oci://other/env@{d}")).unwrap();
         assert_eq!(r.base.scheme(), "https");
 
@@ -944,7 +976,7 @@ pub(crate) mod tests {
             let e = format!("{:#}", registries.parse(&reference).unwrap_err());
             assert!(e.contains(want), "{reference}: {e}");
         }
-        let off = Registries::new(Vec::new(), Vec::new());
+        let off = Registries::new(Vec::new(), Vec::new(), None);
         let e = format!(
             "{:#}",
             off.parse(&format!("oci://ghcr.io/env@{d}")).unwrap_err()
@@ -1076,7 +1108,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn gets_anonymous_tokens() {
         let system = "aarch64-linux";
-        let registry = Registry::start(Login::Token).await;
+        let registry = Registry::start(Login::Token { with_login: false }).await;
         let reference = put_closure(&registry, &[system], Compression::None, &key()).await;
         let artifact = fetch(&registries(&registry), &reference, system)
             .await
@@ -1091,6 +1123,50 @@ pub(crate) mod tests {
         stream.read_to_end(&mut nar).await.unwrap();
         assert!(!nar.is_empty());
         assert_eq!(registry.requests("/token").len(), 1, "{:?}", registry.log);
+    }
+
+    #[tokio::test]
+    async fn logs_in() {
+        let key = key();
+        let tmp = tempfile::tempdir().unwrap();
+        let system = "aarch64-linux";
+        for login in [
+            Login::Basic,
+            Login::Token { with_login: true },
+            Login::Token { with_login: false },
+        ] {
+            let registry = Registry::start(login).await;
+            let reference = put_closure(&registry, &[system], Compression::None, &key).await;
+            let good = self::login(tmp.path(), &registry, PASSWORD);
+            let artifact = fetch(&logged_in(&registry, Some(&good)), &reference, system)
+                .await
+                .unwrap();
+            // NAR fetches log in too.
+            let mut nar = Vec::new();
+            let url = artifact.layers[0].url();
+            let mut stream = (artifact.repository)
+                .stream(url, Compression::None)
+                .await
+                .unwrap();
+            stream.read_to_end(&mut nar).await.unwrap();
+            assert!(!nar.is_empty());
+
+            if login == (Login::Token { with_login: false }) {
+                // Anyone gets a token.
+                assert!(
+                    fetch(&registries(&registry), &reference, system)
+                        .await
+                        .is_ok()
+                );
+                continue;
+            }
+            let bad = self::login(tmp.path(), &registry, "wrong");
+            let msg = fetch_err(&logged_in(&registry, Some(&bad)), &reference, system).await;
+            assert!(msg.contains("refused the login"), "{msg}");
+            assert!(!msg.contains("wrong"), "{msg}");
+            let msg = fetch_err(&registries(&registry), &reference, system).await;
+            assert!(msg.contains("wants a login"), "{msg}");
+        }
     }
 
     #[tokio::test]
@@ -1255,7 +1331,7 @@ pub(crate) mod tests {
     async fn refuses_plain_http_unless_allowed() {
         let registry = Registry::start(Login::None).await;
         let reference = put_closure(&registry, &["aarch64-linux"], Compression::None, &key()).await;
-        let secure = Registries::new(vec![registry.host.clone()], Vec::new());
+        let secure = Registries::new(vec![registry.host.clone()], Vec::new(), None);
         let secure = secure.parse(&reference).unwrap();
         assert_eq!(
             secure.base.as_str(),

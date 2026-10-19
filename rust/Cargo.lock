@@ -1668,6 +1668,7 @@ dependencies = [
  "anyhow",
  "async-compression",
  "backon",
+ "base64 0.22.1",
  "bytesize",
  "clap",
  "foldhash 0.2.0",

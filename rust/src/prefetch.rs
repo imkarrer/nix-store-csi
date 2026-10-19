@@ -255,6 +255,7 @@ mod tests {
 
             closure_registries: Vec::new(),
             insecure_registries: Vec::new(),
+            registry_credentials: None,
         });
         Prefetch::new(Arc::new(store.unwrap()), dir.to_owned())
     }

@@ -115,6 +115,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         measure: false,
         closure_registries,
         insecure_registries: list(&cli.insecure_registries),
+        registry_credentials: cli.registry_credentials,
     };
     match cli.command {
         Command::Unpack { roots, dry_run } => unpack(config, &roots, dry_run).await,
@@ -162,6 +163,7 @@ async fn unpack(config: Config, roots: &[String], dry_run: bool) -> anyhow::Resu
     let registries = Registries::new(
         config.closure_registries.clone(),
         config.insecure_registries.clone(),
+        config.registry_credentials.clone(),
     );
     let wanted = match roots {
         [one] if one.starts_with("oci://") => Wanted::Artifact(registries.parse(one)?),

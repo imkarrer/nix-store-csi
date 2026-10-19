@@ -1216,6 +1216,7 @@ mod tests {
             measure: false,
             closure_registries: vec![registry.host.clone()],
             insecure_registries: vec!["127.0.0.1".to_owned()],
+            registry_credentials: None,
         };
         Arc::new(Store::new(config).unwrap())
     }

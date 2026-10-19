@@ -104,7 +104,7 @@ impl Http {
                 let object = objects.join(url.path().trim_start_matches('/'))?;
                 self.client.get(object).bearer_auth(&token.bearer)
             }
-            Some(Auth::Registry(credentials)) => credentials.authorize(request(), url),
+            Some(Auth::Registry(credentials)) => credentials.authorize(request(), url)?,
         })
     }
 

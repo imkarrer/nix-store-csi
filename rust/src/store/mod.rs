@@ -66,6 +66,8 @@ pub struct Config {
     pub closure_registries: Vec<String>,
     /// Registry hosts that `closure` volumes read over plain HTTP.
     pub insecure_registries: Vec<String>,
+    /// A Docker config file with logins for registries.
+    pub registry_credentials: Option<PathBuf>,
 }
 
 pub struct Store {
@@ -196,7 +198,11 @@ impl Store {
                 Some(narinfos.clone()),
                 config.netrc_file.as_deref(),
             )?,
-            registries: Registries::new(config.closure_registries, config.insecure_registries),
+            registries: Registries::new(
+                config.closure_registries,
+                config.insecure_registries,
+                config.registry_credentials,
+            ),
             narinfos,
             dir,
             views,
@@ -700,6 +706,7 @@ mod tests {
 
             closure_registries: Vec::new(),
             insecure_registries: Vec::new(),
+            registry_credentials: None,
         };
         let new = tmp.path().join("new");
         drop(Store::new(config(&new)).unwrap());

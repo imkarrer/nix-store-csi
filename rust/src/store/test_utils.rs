@@ -47,6 +47,7 @@ pub(super) fn config(fixtures: &Path, cache: &Path, state: &Path) -> Config {
 
         closure_registries: Vec::new(),
         insecure_registries: Vec::new(),
+        registry_credentials: None,
     }
 }
 

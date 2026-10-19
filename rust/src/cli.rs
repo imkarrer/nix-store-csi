@@ -72,6 +72,16 @@ pub struct Cli {
     )]
     pub closure_registries: String,
 
+    /// Docker config file with logins for registries, like the
+    /// `.dockerconfigjson` of an image pull Secret, read on every request.
+    #[arg(
+        long,
+        value_name = "FILE",
+        env = "NIX_STORE_CSI_REGISTRY_CREDENTIALS",
+        global = true
+    )]
+    pub registry_credentials: Option<PathBuf>,
+
     /// Directory that holds the node store in `store/`.
     #[arg(
         long,

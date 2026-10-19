@@ -1,6 +1,6 @@
 //! A registry for the tests, with just enough of the OCI distribution API to
-//! pull: manifests and blobs by digest or tag, and anonymous tokens from its
-//! token service.
+//! pull: manifests and blobs by digest or tag, and logins by basic auth or by
+//! tokens from its token service.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -14,15 +14,22 @@ use hyper::{Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+pub const USER: &str = "ann";
+pub const PASSWORD: &str = "s3cret";
 const TOKEN: &str = "granted-token";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Login {
     /// Anyone may pull.
     None,
-    /// Every request needs a token from the token service, which gives anyone
-    /// one, as for public repositories on ghcr.io.
-    Token,
+    /// Every request needs [`USER`] and [`PASSWORD`] by basic auth, like a
+    /// `registry:2` with htpasswd.
+    Basic,
+    /// Every request needs a token from the token service, which wants
+    /// [`USER`] and [`PASSWORD`] when `with_login`, as on most hosted
+    /// registries, and gives anyone a token otherwise, as for public
+    /// repositories on ghcr.io.
+    Token { with_login: bool },
 }
 
 /// Content by path, with its content type.
@@ -77,11 +84,13 @@ impl Registry {
     }
 
     /// What to answer a request with `authorization` if it may not go on.
-    fn challenge(&self, login: Login, authorization: &str) -> Option<String> {
+    fn challenge(&self, login: Login, authorization: &str, basic: &str) -> Option<String> {
         match login {
             Login::None => None,
-            Login::Token if authorization == format!("Bearer {TOKEN}") => None,
-            Login::Token => Some(format!(
+            Login::Basic if authorization == basic => None,
+            Login::Basic => Some(r#"Basic realm="test""#.to_owned()),
+            Login::Token { .. } if authorization == format!("Bearer {TOKEN}") => None,
+            Login::Token { .. } => Some(format!(
                 r#"Bearer realm="http://{}/token",service="test""#,
                 self.host
             )),
@@ -97,13 +106,24 @@ impl Registry {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_owned();
+        let basic = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("{USER}:{PASSWORD}")
+            )
+        );
         let reply = |status: StatusCode, body: Vec<u8>| {
             let mut response = Response::new(Full::new(Bytes::from(body)));
             *response.status_mut() = status;
             response
         };
         if path == "/token" {
-            if login != Login::Token {
+            let ok = match login {
+                Login::Token { with_login } => !with_login || authorization == basic,
+                _ => false,
+            };
+            if !ok {
                 return reply(StatusCode::UNAUTHORIZED, Vec::new());
             }
             assert!(query.contains("scope=repository%3A"), "{query}");
@@ -112,7 +132,7 @@ impl Registry {
                 format!(r#"{{"token":"{TOKEN}"}}"#).into_bytes(),
             );
         }
-        let challenge = self.challenge(login, &authorization);
+        let challenge = self.challenge(login, &authorization, &basic);
         if let Some(challenge) = challenge {
             let mut response = reply(StatusCode::UNAUTHORIZED, b"{\"errors\":[]}".to_vec());
             response
