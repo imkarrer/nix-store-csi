@@ -203,6 +203,7 @@ rec {
           sed "s/@revision@/$revision/g" ${./alerts-test.yaml} > alerts-test.yaml
           promtool test rules alerts-test.yaml
           helm lint --strict ${chartSrc} --set 'admissionPolicy.allowedNamespaces={default,ci}'
+          helm lint --strict ${chartSrc} --set-json 'substituters=[]' --set 'closureRegistries={registry.local:5000/envs,ghcr.io},insecureRegistries={registry.local}'
           helm lint --strict ${chartSrc} --set 'prefetch.storePaths\.x86_64-linux=/nix/store/00000000000000000000000000000000-hello'
           helm lint --strict ${chartSrc} --set metrics.enabled=true,metrics.prometheusRule.enabled=true --set-json 'nodePools={"gpu":{"nodeSelector":{"pool":"gpu","accel":"nvidia"},"prefetch":{"storePaths":"/nix/store/00000000000000000000000000000000-hello"}},"web":{"nodeSelector":{"pool":"web"}}}'
           # helm lint ignores fail, so these use helm template.
@@ -213,6 +214,11 @@ rec {
             exit 1
           fi
           grep "trustedPublicKeys is empty" err
+          if helm template ${chartSrc} --set-json 'substituters=[]' > /dev/null 2> err; then
+            echo "helm template accepted no substituters and no closureRegistries" >&2
+            exit 1
+          fi
+          grep "substituters and closureRegistries are both empty" err
           for field in version appVersion; do
             grep -qx "$field: ${package.version}" ${chartSrc}/Chart.yaml || {
               echo "Chart.yaml's $field isn't Cargo.toml's ${package.version}" >&2
