@@ -27,6 +27,7 @@ pub const CONFIG_TYPE: &str = "application/vnd.nix-store-csi.closure.config.v1+j
 /// Nix's spelling, like `+xz` or `+zstd`.
 pub const NAR_TYPE: &str = "application/vnd.nix-store-csi.nar.v1";
 pub const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+pub const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 
 pub const STORE_PATH: &str = "nix-store-csi.store-path";
 pub const NAR_HASH: &str = "nix-store-csi.nar-hash";
@@ -100,8 +101,8 @@ pub struct Artifact {
     pub layers: Vec<NarInfo>,
 }
 
-/// A manifest.
-#[derive(Serialize, Deserialize)]
+/// A manifest or an index.
+#[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Document {
     #[serde(default)]
@@ -114,6 +115,8 @@ struct Document {
     config: Option<Descriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     layers: Vec<Descriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    manifests: Vec<Descriptor>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -124,6 +127,16 @@ struct Descriptor {
     size: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     annotations: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform: Option<Platform>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Platform {
+    architecture: String,
+    os: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -240,9 +253,9 @@ impl Registries {
         })
     }
 
-    /// Fetches the manifest that `reference` pins, and its config. Each must
-    /// have the digest that names it, and the config must be for `system`.
-    /// Each layer becomes a narinfo for its store path.
+    /// Fetches the manifest that `reference` pins, or the one for `system` in
+    /// the index it pins, and its config. Each must have the digest that names
+    /// it. Each layer becomes a narinfo for its store path.
     pub async fn fetch(
         &self,
         reference: &Reference,
@@ -260,17 +273,36 @@ impl Registries {
         store_dir: &StoreDir,
     ) -> anyhow::Result<Artifact> {
         let repository = Self::repository(&reference.host, &reference.name, &reference.base)?;
-        let (content_type, manifest) = (get_document(&repository.transport, &reference.digest))
-            .await
+        let pinned = (get_document(&repository.transport, &reference.digest).await)
             .map_err(|e| hint(&reference.base, e))?;
-        let media_type = (manifest.media_type.as_deref())
-            .or(content_type.as_deref())
-            .map(|t| t.split(';').next().unwrap_or_default().trim());
-        ensure!(
-            media_type == Some(MANIFEST_TYPE),
-            "the artifact is a {}, not a {MANIFEST_TYPE}",
-            media_type.unwrap_or("document with no media type")
-        );
+        let manifest = match kind(&pinned)? {
+            Kind::Manifest => pinned.1,
+            Kind::Index => {
+                let arch = oci_arch(system)?;
+                let entry = (pinned.1.manifests.iter())
+                    .find(|m| {
+                        m.platform
+                            .as_ref()
+                            .is_some_and(|p| p.os == "linux" && p.architecture == arch)
+                            && m.artifact_type
+                                .as_deref()
+                                .is_none_or(|t| t == ARTIFACT_TYPE)
+                    })
+                    .with_context(|| format!("the index has no manifest for linux/{arch}"))?;
+                ensure!(
+                    entry.media_type == MANIFEST_TYPE,
+                    "the index's manifest for linux/{arch} is a {}, not a {MANIFEST_TYPE}",
+                    entry.media_type
+                );
+                check_digest(&entry.digest)?;
+                let child = get_document(&repository.transport, &entry.digest).await?;
+                ensure!(
+                    matches!(kind(&child)?, Kind::Manifest),
+                    "the index's manifest for linux/{arch} isn't a manifest"
+                );
+                child.1
+            }
+        };
         if let Some(t) = &manifest.artifact_type {
             ensure!(
                 t == ARTIFACT_TYPE,
@@ -326,16 +358,33 @@ fn hint(base: &Url, e: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// The manifest with `digest`, which must be its SHA-256.
+enum Kind {
+    Manifest,
+    Index,
+}
+
+/// Whether a document is a manifest or an index, by its `mediaType` or else
+/// its `Content-Type`.
+fn kind((content_type, document): &(Option<String>, Document)) -> anyhow::Result<Kind> {
+    let media_type = (document.media_type.as_deref())
+        .or(content_type.as_deref())
+        .map(|t| t.split(';').next().unwrap_or_default().trim());
+    match media_type {
+        Some(MANIFEST_TYPE) => Ok(Kind::Manifest),
+        Some(INDEX_TYPE) => Ok(Kind::Index),
+        Some(other) => bail!("{other} is neither a {MANIFEST_TYPE} nor a {INDEX_TYPE}"),
+        None => bail!("the document has no media type"),
+    }
+}
+
+/// The manifest or index with `digest`, which must be its SHA-256.
 async fn get_document(
     transport: &Transport,
     digest: &str,
 ) -> anyhow::Result<(Option<String>, Document)> {
+    let accept = format!("{MANIFEST_TYPE}, {INDEX_TYPE}");
     let path = format!("manifests/{digest}");
-    let (body, content_type) = match transport
-        .get_typed(&path, MANIFEST_TYPE, MAX_MANIFEST)
-        .await
-    {
+    let (body, content_type) = match transport.get_typed(&path, &accept, MAX_MANIFEST).await {
         Err(e) if transport::lacks_file(&e) => {
             return Err(e.context(format!("the registry has no manifest {digest}")));
         }
@@ -410,6 +459,15 @@ fn check_name(name: &str) -> anyhow::Result<()> {
         ensure!(ok, "bad repository name {name:?}");
     }
     Ok(())
+}
+
+/// OCI's name for the architecture of a Nix system.
+fn oci_arch(system: &str) -> anyhow::Result<&'static str> {
+    Ok(match system {
+        "x86_64-linux" => "amd64",
+        "aarch64-linux" => "arm64",
+        _ => bail!("no OCI platform for {system}"),
+    })
 }
 
 /// The compression of a NAR layer of `media_type`.
@@ -645,6 +703,8 @@ pub(crate) mod tests {
             digest,
             size,
             annotations: BTreeMap::new(),
+            artifact_type: None,
+            platform: None,
         }
     }
 
@@ -662,12 +722,14 @@ pub(crate) mod tests {
             digest,
             size: body.len() as u64,
             annotations: BTreeMap::new(),
+            artifact_type: Some(ARTIFACT_TYPE.to_owned()),
+            platform: None,
         }
     }
 
-    /// Puts the closure of `app` for each of `systems`, of which there can be
-    /// only one, in `registry` as a manifest, with NARs of `compression` and
-    /// signatures by `key`, and returns the reference.
+    /// Puts the closure of `app` for each of `systems` in `registry`, with
+    /// NARs of `compression` and signatures by `key`, as a manifest for one
+    /// system or an index for several, and returns the reference.
     pub async fn put_closure(
         registry: &Registry,
         systems: &[&str],
@@ -710,13 +772,28 @@ pub(crate) mod tests {
                 artifact_type: Some(ARTIFACT_TYPE.to_owned()),
                 config: Some(put_blob(registry, config, CONFIG_TYPE)),
                 layers,
+                manifests: Vec::new(),
             };
-            manifests.push(put_manifest(registry, &manifest, MANIFEST_TYPE));
+            let mut descriptor = put_manifest(registry, &manifest, MANIFEST_TYPE);
+            descriptor.platform = Some(Platform {
+                architecture: oci_arch(system).unwrap().to_owned(),
+                os: "linux".to_owned(),
+            });
+            manifests.push(descriptor);
         }
-        let Ok([manifest]) = <[_; 1]>::try_from(manifests) else {
-            panic!("a manifest holds one system");
+        let digest = match <[_; 1]>::try_from(manifests) {
+            Ok([manifest]) => manifest.digest,
+            Err(manifests) => {
+                let index = Document {
+                    schema_version: 2,
+                    media_type: Some(INDEX_TYPE.to_owned()),
+                    artifact_type: Some(ARTIFACT_TYPE.to_owned()),
+                    manifests,
+                    ..Document::default()
+                };
+                put_manifest(registry, &index, INDEX_TYPE).digest
+            }
         };
-        let digest = manifest.digest;
         format!("oci://{}/{NAME}@{digest}", registry.host)
     }
 
@@ -931,6 +1008,37 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn reads_an_index_for_two_systems() {
+        let key = key();
+        let registry = Registry::start().await;
+        let systems = ["x86_64-linux", "aarch64-linux"];
+        let reference = put_closure(&registry, &systems, Compression::Zstd, &key).await;
+        let digest = reference.rsplit_once('@').unwrap().1;
+        let index: Value = serde_json::from_slice(
+            &registry
+                .get(&format!("/v2/{NAME}/manifests/{digest}"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index["mediaType"], INDEX_TYPE);
+        let platforms: Vec<_> = (index["manifests"].as_array().unwrap().iter())
+            .map(|m| m["platform"]["architecture"].as_str().unwrap())
+            .collect();
+        assert_eq!(platforms, ["amd64", "arm64"]);
+        for system in systems {
+            let artifact = fetch(&registries(&registry), &reference, system)
+                .await
+                .unwrap();
+            assert_eq!(
+                artifact.roots,
+                [objects(system)[2].path.clone()],
+                "{system}"
+            );
+            assert_eq!(artifact.layers.len(), 3);
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_wrong_digests() {
         let key = key();
         let system = "aarch64-linux";
@@ -972,6 +1080,29 @@ pub(crate) mod tests {
             msg.contains(&format!("the registry has no manifest {missing}")),
             "{msg}"
         );
+
+        // An index entry whose digest doesn't match the manifest it names.
+        let index = json!({
+            "schemaVersion": 2,
+            "mediaType": INDEX_TYPE,
+            "manifests": [{
+                "mediaType": MANIFEST_TYPE,
+                "digest": wrong,
+                "size": manifest.len(),
+                "platform": { "architecture": "arm64", "os": "linux" },
+            }],
+        })
+        .to_string()
+        .into_bytes();
+        let d = super::digest(&index);
+        registry.put(format!("/v2/{NAME}/manifests/{d}"), INDEX_TYPE, index);
+        let msg = fetch_err(
+            &registries,
+            &format!("oci://{}/{NAME}@{d}", registry.host),
+            system,
+        )
+        .await;
+        assert!(msg.contains("sent content with digest"), "{msg}");
 
         // A config that doesn't match its digest.
         let manifest: Value = serde_json::from_slice(&manifest).unwrap();
