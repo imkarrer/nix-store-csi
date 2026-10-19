@@ -68,6 +68,8 @@
       "type": "array",
       "items": { "type": "string", "pattern": "^[^/@:\\s]+(:[0-9]+)?(/[^@:\\s]+)?$" }
     },
+    "registryCredentialsSecret": { "type": "string" },
+    "extraCACertificates": { "type": "string" },
     "insecureRegistries": {
       "type": "array",
       "items": { "type": "string", "pattern": "^[^/@\\s]+$" }

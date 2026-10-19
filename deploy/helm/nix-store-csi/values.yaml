@@ -40,6 +40,12 @@ closureRegistries: []
 # OCI registry hosts, like registry.local or registry.local:5000, that `closure`
 # volumes read over plain HTTP instead of HTTPS.
 insecureRegistries: []
+# A Secret of type kubernetes.io/dockerconfigjson, like an image pull Secret,
+# with logins for the registries in closureRegistries.
+registryCredentialsSecret: ""
+# A ConfigMap whose keys are PEM CA certificates that the plugin trusts besides
+# the usual ones, for caches and registries with a private CA.
+extraCACertificates: ""
 # A Secret whose netrc key holds the caches' credentials in netrc format:
 #   machine cache.example.com login user password secret
 netrcSecret: ""

@@ -203,7 +203,7 @@ rec {
           sed "s/@revision@/$revision/g" ${./alerts-test.yaml} > alerts-test.yaml
           promtool test rules alerts-test.yaml
           helm lint --strict ${chartSrc} --set 'admissionPolicy.allowedNamespaces={default,ci}'
-          helm lint --strict ${chartSrc} --set-json 'substituters=[]' --set 'closureRegistries={registry.local:5000/envs,ghcr.io},insecureRegistries={registry.local}'
+          helm lint --strict ${chartSrc} --set-json 'substituters=[]' --set 'closureRegistries={registry.local:5000/envs,ghcr.io},insecureRegistries={registry.local},registryCredentialsSecret=pull,extraCACertificates=ca'
           helm lint --strict ${chartSrc} --set 'prefetch.storePaths\.x86_64-linux=/nix/store/00000000000000000000000000000000-hello'
           helm lint --strict ${chartSrc} --set metrics.enabled=true,metrics.prometheusRule.enabled=true --set-json 'nodePools={"gpu":{"nodeSelector":{"pool":"gpu","accel":"nvidia"},"prefetch":{"storePaths":"/nix/store/00000000000000000000000000000000-hello"}},"web":{"nodeSelector":{"pool":"web"}}}'
           # helm lint ignores fail, so these use helm template.
