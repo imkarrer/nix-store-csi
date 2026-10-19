@@ -31,6 +31,10 @@
   empty.
 - `--insecure-registries` and the chart's `insecureRegistries`, registry
   hosts that the plugin reads over plain HTTP.
+- `--registry-credentials` and the chart's `registryCredentialsSecret`, a
+  Docker config with logins for registries.
+- The chart's `extraCACertificates`, a ConfigMap of CA certificates that the
+  plugin trusts besides the image's.
 - `unpack` takes an `oci://` reference.
 
 ## 0.1.7 - 2026-10-21

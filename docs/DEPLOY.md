@@ -145,14 +145,34 @@ closureRegistries:
 # Only for registries that serve plain HTTP, like one in the cluster.
 insecureRegistries:
   - registry.registry.svc
+# Logins, in a Secret of type kubernetes.io/dockerconfigjson.
+registryCredentialsSecret: registry-login
 ```
 
-- The plugin reads repositories that need no login, and those that ask for
-  an anonymous token, like public repositories on ghcr.io.
+- The Secret has the format of an image pull Secret, so
+  `kubectl create secret docker-registry` makes one. The plugin reads it for
+  every request, so changes apply without a restart. It sends the login to
+  the registry's host, and gets a token where the registry asks for one.
+  Public repositories need no Secret.
 - The paths in an artifact need signatures by `trustedPublicKeys`, as from a
   cache, so with `--no-require-sigs` the plugin refuses `closure` volumes.
 - With `closureRegistries`, `substituters` may be empty. The nodes then need
   no binary cache, only the registries.
+
+### Private CAs
+
+`extraCACertificates` names a ConfigMap in the plugin's namespace whose keys
+are PEM certificates. The plugin trusts them besides the image's CA
+certificates, for registries and caches:
+
+```sh
+kubectl -n kube-system create configmap company-ca --from-file=ca.crt
+```
+
+```yaml
+# values.yaml
+extraCACertificates: company-ca
+```
 
 ### Prefetching
 

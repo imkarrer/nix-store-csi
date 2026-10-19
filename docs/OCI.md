@@ -139,8 +139,12 @@ name. Plain HTTP needs the host in `insecureRegistries` too. If a NAR from a
 registry fails, the plugin looks for the path in `substituters`, and takes it
 only from a narinfo with the same `NarHash`.
 
-## Logins
+## Credentials
 
-The plugin reads repositories that need no login. It answers a
-`WWW-Authenticate: Bearer` challenge with an anonymous token from the
-registry's token service, as public repositories on ghcr.io need.
+`registryCredentialsSecret` names a Secret of type
+`kubernetes.io/dockerconfigjson`, like an image pull Secret. The plugin reads
+it for every request, sends its login for the registry's host, and answers a
+`WWW-Authenticate: Bearer` challenge with a token from the registry's token
+service, as Docker does. A repository that needs no login works without the
+Secret, and so do public repositories that ask for an anonymous token, like
+those on ghcr.io.
