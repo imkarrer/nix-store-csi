@@ -226,12 +226,22 @@ fn failed_tls(e: &reqwest::Error) -> bool {
     }
     let mut source = std::error::Error::source(e);
     while let Some(e) = source {
-        if (e.downcast_ref::<io::Error>()).is_some_and(|e| e.kind() == io::ErrorKind::InvalidData) {
+        if (e.downcast_ref::<io::Error>()).is_some_and(invalid_data) {
             return true;
         }
         source = e.source();
     }
     false
+}
+
+/// Whether `e` is invalid data, or wraps an `io::Error` that is. hyper-util
+/// wraps the TLS stack's error in one of kind `Other`, and an `io::Error`'s
+/// `source` skips the error it wraps.
+fn invalid_data(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::InvalidData
+        || (e.get_ref())
+            .and_then(|inner| inner.downcast_ref::<io::Error>())
+            .is_some_and(invalid_data)
 }
 
 /// The response's `Content-Encoding`. Nix sets it on the narinfos it
@@ -1126,6 +1136,29 @@ pub(crate) mod tests {
             }
         });
         (format!("http://{addr}"), counted)
+    }
+
+    /// HTTPS to a server that answers in plain HTTP fails at once, since a
+    /// retry would fail the same way.
+    #[tokio::test]
+    async fn gives_up_on_plain_http_over_https() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            }
+        });
+        let t = open(&format!("https://{addr}")).unwrap();
+        let started = std::time::Instant::now();
+        let err = t.get("x.narinfo").await.unwrap_err();
+        assert!(format!("{err:#}").contains("InvalidContentType"), "{err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

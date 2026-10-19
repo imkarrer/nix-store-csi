@@ -9,6 +9,13 @@
   it resolves, so a cache that speaks only HTTP/1.1 gets at most 128
   connections for narinfos.
 
+### Fixed
+
+- A request to a cache whose TLS handshake fails fails at once, as for a
+  certificate that expired, one the node does not trust or one for another
+  host name, or a server that answers in plain HTTP. Before, each narinfo
+  lookup and NAR fetch retried for a minute once the cache had opened.
+
 ## 0.1.7 - 2026-10-21
 
 ### Changed
