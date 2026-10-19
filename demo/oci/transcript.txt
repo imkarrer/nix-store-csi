@@ -1,0 +1,191 @@
+
+== 0. Set up: a cluster, three private registries, and the plugin without substituters ==
+Creating cluster "nsc-demo" ...
+ • Ensuring node image (kindest/node:v1.36.1) 🖼  ...
+ ✓ Ensuring node image (kindest/node:v1.36.1) 🖼
+ • Preparing nodes 📦   ...
+ ✓ Preparing nodes 📦 
+ • Writing configuration 📜  ...
+ ✓ Writing configuration 📜
+ • Starting control-plane 🕹️  ...
+ ✓ Starting control-plane 🕹️
+ • Installing CNI 🔌  ...
+ ✓ Installing CNI 🔌
+ • Installing StorageClass 💾  ...
+ ✓ Installing StorageClass 💾
+Set kubectl context to "kind-nsc-demo"
+You can now use your cluster with:
+
+kubectl cluster-info --context kind-nsc-demo
+
+Not sure what to do next? 😅  Check out https://kind.sigs.k8s.io/docs/user/quick-start/
+Image: "nix-store-csi:oci-closure" with ID "sha256:ad6872368dc98b5af9ce6017e3f8e9cf48400bbce697095184028252d2ee66d3" not yet present on node "nsc-demo-control-plane", loading...
+$ helm --kube-context kind-nsc-demo upgrade --install nix-store-csi /Users/imkarrer/src/nix-store-csi/_worktrees/up-tls/deploy/helm/nix-store-csi -n kube-system -f /var/folders/1p/45cbtj7x7wl_yqy9ykspv8040000gn/T/tmp.IaXV23F2tQ/values.yaml --wait
+plugin values:
+  image:
+    repository: docker.io/library/nix-store-csi
+    tag: oci-closure
+    pullPolicy: IfNotPresent
+  # No binary cache at all: the nodes get every store path from the registries.
+  substituters: []
+  trustedPublicKeys: [cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=]
+  closureRegistries: [registry-a.registries.svc, registry-b.registries.svc, registry-c.registries.svc]
+  registryCredentialsSecret: nsc-registries
+  extraCACertificates: nsc-demo-ca
+
+== 1. Push the closure of hello and jq for two systems into registry A ==
+  push: uploaded 0 NARs, 0 were in the registry already
+pushed: oci://registry-a.registries.svc/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+$ crane --insecure manifest localhost:5443/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "artifactType": "application/vnd.nix-store-csi.closure.v1",
+  "manifests": [
+    {
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      },
+      "digest": "sha256:8f1a61a8c45a1a0fdf406648cb91ce2341eabfa5e5faadf5d67a300b4cd4f1be"
+    },
+    {
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      },
+      "digest": "sha256:86ba2b4f4490cb5bfc22ec73577f40b941e78f8a0f5128264e40977b9ca2deb3"
+    }
+  ]
+}
+$ crane --insecure manifest localhost:5443/envs/tools@sha256:8f1a61a8c45a1a0fdf406648cb91ce2341eabfa5e5faadf5d67a300b4cd4f1be
+{
+  "config": "application/vnd.nix-store-csi.closure.config.v1+json",
+  "layers": [
+    {
+      "mediaType": "application/vnd.nix-store-csi.nar.v1+zstd",
+      "path": "/nix/store/062622c3illzg3jzzqv40s7l30pif8cw-oniguruma-6.9.10-lib"
+    },
+    {
+      "mediaType": "application/vnd.nix-store-csi.nar.v1+zstd",
+      "path": "/nix/store/5fmknmxx5s78zbbai817zghzmc5l7d3z-xgcc-15.3.0-libgcc"
+    },
+    {
+      "mediaType": "application/vnd.nix-store-csi.nar.v1+zstd",
+      "path": "/nix/store/846h582z2d4mifn4km7axlqllcyn6zdg-hello-2.12.3"
+    },
+    {
+      "mediaType": "application/vnd.nix-store-csi.nar.v1+zstd",
+      "path": "/nix/store/929svfrm3z9facma5l7y3pkym56b8gni-libidn2-2.3.8"
+    },
+    {
+      "mediaType": "application/vnd.nix-store-csi.nar.v1+zstd",
+      "path": "/nix/store/b57ihysnpkp69hsbbw1gr1yjac6xagkf-libunistring-1.4.2"
+    },
+    {
+      "mediaType": "application/vnd.nix-store-csi.nar.v1+zstd",
+      "path": "/nix/store/f8q4w2hbjvwy7qqwpnvbf5f4qwyww6cp-glibc-2.42-67"
+    },
+    {
+      "mediaType": "application/vnd.nix-store-csi.nar.v1+zstd",
+      "path": "/nix/store/idak61zxiv384i26xpk1rgq17bwfpk74-jq-1.8.2-bin"
+    },
+    {
+      "mediaType": "application/vnd.nix-store-csi.nar.v1+zstd",
+      "path": "/nix/store/p6gmwpax6i1pbvcpqxg51swl5zn6lrrw-jq-1.8.2"
+    }
+  ]
+}
+
+== 2. One digest for every architecture ==
+The pod pins one reference, and each node takes the manifest for its own architecture:
+  closure: oci://registry-a.registries.svc/envs/tools:latest@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+With storePaths, the same pod lists a store path per system:
+  storePaths.x86_64-linux: /nix/store/lcxc2z1h2g8wq8dxfpizy1di85kyxnqx-hello-2.12.3 /nix/store/25pcd19xk5ff8ybjslsips4g7yv06fxl-jq-1.8.2-bin
+  storePaths.aarch64-linux: /nix/store/846h582z2d4mifn4km7axlqllcyn6zdg-hello-2.12.3 /nix/store/idak61zxiv384i26xpk1rgq17bwfpk74-jq-1.8.2-bin
+pod/tools-a created
+  log: hello from aarch64
+  log: {"tool":"jq","version":"1.8.2"}
+The plugin's log for the volume, with the artifact it read the closure from:
+  publish{volume="csi-d68738e1d65d35528a128be37c08a9ba8e04d23503cc98d5806fab1fc0dd5c03"}: nix_store_csi::csi: published store_paths=846h582z2d4mifn4km7axlqllcyn6zdg-hello-2.12.3 idak61zxiv384i26xpk1rgq17bwfpk74-jq-1.8.2-bin artifact=oci://registry-a.registries.s
+  unpublish{volume="csi-d68738e1d65d35528a128be37c08a9ba8e04d23503cc98d5806fab1fc0dd5c03"}: nix_store_csi::csi: unpublished
+Unlocked: one immutable reference covers aarch64-linux and x86_64-linux; adding a system changes the artifact, not the pod spec.
+With storePaths: a storePaths.<system> attribute per system, each a different store path to keep in sync.
+
+== 3. Promotion and an air gap: copy the artifact to registry B ==
+$ crane --insecure copy localhost:5443/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c localhost:5444/envs/tools:latest
+2026/10/22 16:55:01 localhost:5444/envs/tools:latest: digest: sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c size: 667
+$ crane --insecure digest localhost:5444/envs/tools:latest
+sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+Only the host in the pod spec changes; the digest stays:
+  oci://registry-a.registries.svc/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+  oci://registry-b.registries.svc/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+pod/tools-b created
+  log: hello from aarch64
+  log: {"tool":"jq","version":"1.8.2"}
+The plugin has no binary cache configured:
+{"name":"NIX_STORE_CSI_SUBSTITUTERS"}
+Unlocked: any registry mirror tool (crane copy, oras copy, skopeo, Harbor replication) moves a whole closure into an air-gapped registry as one unit, digest unchanged.
+With storePaths: every cluster needs a binary cache that holds those paths and is signed by a key it trusts (nix copy per path, cache and key per environment).
+
+== 4. Refusals, each as the pod's event ==
+A registry that closureRegistries doesn't list:
+pod/not-allowed created
+  event: ghcr.io/example/tools is not in --closure-registries
+A tag without a digest:
+pod/tag-only created
+  event: "oci://registry-a.registries.svc/envs/tools:latest" has no digest; pin it like oci://<host>/<name>@sha256:<digest>
+Registry C, for which the plugin's Secret has the wrong password:
+$ crane --insecure copy localhost:5443/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c localhost:5445/envs/tools:latest
+pod/wrong-login created
+  event: reading oci://registry-c.registries.svc/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c: fetching https://registry-c.registries.svc/v2/envs/tools/manifests/sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c: got 401 Unauthorized: {"errors":[{"code":"UNAUTHORIZED","message":"authentication required","detail":[{"Type":"repository","Class":"","Name":"envs/tools","Action":"pull"}]}]}: the registry refused the login for registry-c.registries.svc
+Content changed in the registry by someone who may push, here jq's NarHash:
+pod/tampered created
+  event: oci://registry-a.registries.svc/envs/tools has no trusted signature for /nix/store/idak61zxiv384i26xpk1rgq17bwfpk74-jq-1.8.2-bin, signed by cache.nixos.org-1 (invalid)
+Unlocked: the registry is an untrusted transport: the digest pins the artifact, and each path still needs a trusted narinfo signature.
+
+== 5. Policy at admission: only registry B, only by digest ==
+A pod from registry A, which the policy refuses when it's applied:
+$ kubectl apply -f pod-from-a.yaml
+  The pods "policy-a" is invalid: : ValidatingAdmissionPolicy 'closures-from-registry-b' with binding 'closures-from-registry-b' denied request: closure volumes must come from registry-b.registries.svc, pinned by digest
+The same pod from registry B:
+pod/policy-b created
+  log: hello from aarch64
+  log: {"tool":"jq","version":"1.8.2"}
+A storePaths pod for a path that no cache has. The API server admits it, and it waits:
+pod/store-paths created
+  store-paths   0/1   ContainerCreating   0     10s
+  event: /nix/store/00000000000000000000000000000000-hello-2.12.3 is not in any cache with a trusted signature
+Unlocked: admission policies, Kyverno and Gatekeeper read the registry and digest in the pod spec; Argo CD shows the refusal as a sync error at once.
+With storePaths: the API server admits any store path; a wrong one shows up as a pod stuck in ContainerCreating (Argo CD: Progressing until it times out).
+
+== 6. Automated bumps: Renovate follows the tag and updates the digest ==
+CI pushes a new version of the closure, with figlet added, to the same tag:
+  push: uploaded 0 NARs, 0 were in the registry already
+pushed: oci://registry-a.registries.svc/envs/tools@sha256:ab305a108427d22ff53587daa90990755dd1f44508b4b7278c747964e196226d
+$ renovate --platform=local --dry-run=lookup
+  envs/tools:latest sha256:58f57c23b15c... -> sha256:ab305a108427... (digest)
+Unlocked: Renovate, Flux image automation and Argo CD Image Updater bump closures from the registry's tags, with no Nix in the loop.
+With storePaths: CI evaluates Nix and fills the paths into manifests (deploy/manifests.nix and envsubst) to bump anything.
+
+== 7. Registry tooling works on closures ==
+$ cosign sign --allow-insecure-registry --yes --key /var/folders/1p/45cbtj7x7wl_yqy9ykspv8040000gn/T/tmp.IaXV23F2tQ/cosign.key --tlog-upload=false --use-signing-config=false localhost:5443/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+Pushing signature to: localhost:5443/envs/tools
+$ cosign verify --allow-insecure-registry --key /var/folders/1p/45cbtj7x7wl_yqy9ykspv8040000gn/T/tmp.IaXV23F2tQ/cosign.pub --insecure-ignore-tlog=true localhost:5443/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+  - The cosign claims were validated
+  - Existence of the claims in the transparency log was verified offline
+  - The signatures were verified against the specified public key
+$ oras discover --plain-http=false --insecure --format tree localhost:5443/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+localhost:5443/envs/tools@sha256:58f57c23b15c502495d0069ddd93ef4f55752605ea2ce8ad0ac10f2bdd49158c
+└── application/vnd.dev.sigstore.bundle.v0.3+json
+    └── sha256:17adedd6682258d88a13920c416938685f3d3da27d86fe03eeccbd2ad40ec809
+Unlocked: signing, verification and inspection tools work on the closure as on any image: cosign, oras, crane.
+
+== Side by side ==
+                       | storePaths                                              | closure (OCI)
+----------------------------------------------------------------------------------------------------------------------------------
+Pinning                | an immutable store path in the pod spec                 | an immutable digest in the pod spec
+Architectures          | one storePaths.<system> list per system                 | one index digest for every system
+Promotion, air gap     | nix copy into a reachable cache; nodes need that cache  | crane copy A to B; same digest; no cache on the nodes
+Policy                 | admitted; fails later as a mount error                  | refused at admission by registry and digest
+Bumps                  | custom CI that evaluates Nix and envsubsts paths        | Renovate (docker datasource) bumps the digest from the tag
+Inspection, signing    | nix path-info against a cache; narinfo signatures only  | crane, oras, cosign on the digest; narinfo signatures still checked
