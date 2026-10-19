@@ -12,8 +12,8 @@ use object_store::signer::{Method, Signer};
 use percent_encoding::percent_decode_str;
 use reqwest::StatusCode;
 use reqwest::header::{
-    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, ETAG, HeaderValue, IF_RANGE, LAST_MODIFIED,
-    RANGE, RETRY_AFTER,
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderValue,
+    IF_RANGE, LAST_MODIFIED, RANGE, RETRY_AFTER,
 };
 use tokio::io::{AsyncBufRead, AsyncReadExt, BufReader};
 use tokio::time::Instant;
@@ -264,21 +264,21 @@ fn nar_encoding(resp: &reqwest::Response) -> Compression {
 }
 
 /// `body` decoded from `encoding`.
-async fn decode(body: Vec<u8>, encoding: Compression) -> anyhow::Result<Vec<u8>> {
+async fn decode(body: Vec<u8>, encoding: Compression, max: u64) -> anyhow::Result<Vec<u8>> {
     if encoding == Compression::None {
         return Ok(body);
     }
-    // Decoding can make a small body far bigger, so MAX_GET applies again.
+    // Decoding can make a small body far bigger, so `max` applies again.
     let mut data = Vec::new();
     encoding
         .decoder(io::Cursor::new(body))
-        .take(MAX_GET + 1)
+        .take(max + 1)
         .read_to_end(&mut data)
         .await
         .context("decoding the body")?;
     ensure!(
-        data.len() as u64 <= MAX_GET,
-        "body decodes to more than {MAX_GET} bytes"
+        data.len() as u64 <= max,
+        "body decodes to more than {max} bytes"
     );
     Ok(data)
 }
@@ -390,6 +390,15 @@ impl std::fmt::Display for Missing {
 }
 
 impl std::error::Error for Missing {}
+
+/// Whether `e` is a request that couldn't connect, or failed its TLS
+/// handshake.
+pub fn failed_to_connect(e: &anyhow::Error) -> bool {
+    (e.chain()).any(|e| {
+        e.downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_connect)
+    })
+}
 
 /// Whether `e` says the cache hasn't got a file. The cache may still have its
 /// other files.
@@ -512,26 +521,57 @@ impl Transport {
         })
     }
 
+    /// The repository of an OCI registry at `base`, like
+    /// `https://host/v2/<name>/`.
+    pub fn registry(base: &Url) -> anyhow::Result<Self> {
+        ensure!(
+            matches!(base.scheme(), "http" | "https"),
+            "a registry needs http(s)://"
+        );
+        Ok(Self::Http(Http {
+            base: redact(base),
+            client: client()?,
+            auth: None,
+        }))
+    }
+
     /// A small file like a narinfo, or `None` if the cache hasn't got it.
     pub async fn get(&self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        match self.get_with(path, true).await {
+        match self.get_with(path, true, None, MAX_GET).await {
             Err(e) if lacks_file(&e) => Ok(None),
-            result => result.map(Some),
+            result => result.map(|(body, _)| Some(body)),
         }
     }
 
     /// Like [`Transport::get`], without retrying. A missing file is an error
     /// that [`lacks_file`] matches, and it keeps what the cache said.
     pub async fn get_once(&self, path: &str) -> anyhow::Result<Vec<u8>> {
-        self.get_with(path, false).await
+        Ok(self.get_with(path, false, None, MAX_GET).await?.0)
     }
 
-    async fn get_with(&self, path: &str, retries: bool) -> anyhow::Result<Vec<u8>> {
+    /// Like [`Transport::get`], with an `Accept` header and a limit of `max`
+    /// bytes. Also returns the `Content-Type`. A missing file is an error.
+    pub async fn get_typed(
+        &self,
+        path: &str,
+        accept: &str,
+        max: u64,
+    ) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+        self.get_with(path, true, Some(accept), max).await
+    }
+
+    async fn get_with(
+        &self,
+        path: &str,
+        retries: bool,
+        accept: Option<&str>,
+        max: u64,
+    ) -> anyhow::Result<(Vec<u8>, Option<String>)> {
         match self {
             Self::File(base) => {
                 let file = file_path(base, path)?;
                 match tokio::fs::read(&file).await {
-                    Ok(data) => Ok(data),
+                    Ok(data) => Ok((data, None)),
                     // A missing cache directory is an error, not a missing file.
                     Err(e) if e.kind() == io::ErrorKind::NotFound && base.is_dir() => {
                         Err(Missing(format!("no {}", file.display())).into())
@@ -542,20 +582,23 @@ impl Transport {
             Self::Http(http) => {
                 let url = request_url(&http.base, path)?;
                 retry(&url, retries, || async {
-                    let request = http.request(&url).await?;
-                    let resp = request.header(ACCEPT_ENCODING, ENCODINGS).send().await?;
-                    let mut resp = check_status(resp).await?;
+                    let mut request = http.request(&url).await?.header(ACCEPT_ENCODING, ENCODINGS);
+                    if let Some(accept) = accept {
+                        request = request.header(ACCEPT, accept);
+                    }
+                    let mut resp = check_status(request.send().await?).await?;
                     let encoding = content_encoding(&resp)?;
+                    let content_type = (resp.headers().get(CONTENT_TYPE))
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
                     let mut body = Vec::new();
                     while let Some(chunk) = resp.chunk().await? {
-                        if (body.len() + chunk.len()) as u64 > MAX_GET {
-                            return Err(
-                                anyhow::anyhow!("body is larger than {MAX_GET} bytes").into()
-                            );
+                        if (body.len() + chunk.len()) as u64 > max {
+                            return Err(anyhow::anyhow!("body is larger than {max} bytes").into());
                         }
                         body.extend_from_slice(&chunk);
                     }
-                    Ok(decode(body, encoding).await?)
+                    Ok((decode(body, encoding, max).await?, content_type))
                 })
                 .await
             }

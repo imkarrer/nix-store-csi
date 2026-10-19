@@ -22,7 +22,8 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::closure::Entry;
 use crate::narinfo::Compression;
-use crate::store_path::Names;
+use crate::oci::{self, Repository};
+use crate::store_path::{self, Names};
 use crate::transport;
 
 use super::fs::{Scratch, rename_tree};
@@ -33,6 +34,48 @@ const NAR_RESTARTS: ConstantBuilder = ConstantBuilder::new().with_max_times(2);
 
 pub(super) type Fetch = Shared<BoxFuture<'static, Result<(), Arc<String>>>>;
 
+/// The closure that a volume or a prefetch asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wanted {
+    /// The closure of these store paths, from the caches.
+    StorePaths(Vec<StorePath>),
+    /// The closure that an artifact lists, from its registry.
+    Artifact(oci::Reference),
+}
+
+impl Wanted {
+    /// The artifact, if the closure comes from one.
+    pub fn artifact(&self) -> Option<&oci::Reference> {
+        match self {
+            Self::StorePaths(_) => None,
+            Self::Artifact(reference) => Some(reference),
+        }
+    }
+}
+
+impl std::fmt::Display for Wanted {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::StorePaths(roots) => Names(roots).fmt(f),
+            Self::Artifact(reference) => reference.fmt(f),
+        }
+    }
+}
+
+/// A closure in the store.
+pub struct Ensured {
+    /// The store paths that the volume or artifact names.
+    pub roots: Vec<StorePath>,
+    /// Every store path in the closure, sorted.
+    pub paths: Arc<[StorePath]>,
+}
+
+/// Where a NAR comes from.
+enum Source {
+    Cache(usize),
+    Registry(Arc<Repository>),
+}
+
 impl Store {
     /// Starts fetching the paths in the closure of `roots` that the store
     /// lacks. Resolution and the fetches run in a task of their own, so they
@@ -40,30 +83,35 @@ impl Store {
     /// fails with [`TooBig`] before any fetch starts. Paths that a
     /// [`Store::prefetch`] holds don't count towards the limit.
     pub fn ensure(self: &Arc<Self>, roots: &[StorePath]) -> Ensuring {
-        self.start_ensure(roots, false)
+        self.start_ensure(Wanted::StorePaths(roots.to_vec()), false)
+    }
+
+    /// Like [`Store::ensure`], for any [`Wanted`] closure.
+    pub fn ensure_wanted(self: &Arc<Self>, wanted: Wanted) -> Ensuring {
+        self.start_ensure(wanted, false)
     }
 
     /// Like [`Store::ensure`] with no limit. Until its hold on the closure
     /// ends, the closure doesn't count towards the limit of other ensures.
     pub fn prefetch(self: &Arc<Self>, roots: &[StorePath]) -> Ensuring {
-        self.start_ensure(roots, true)
+        self.start_ensure(Wanted::StorePaths(roots.to_vec()), true)
     }
 
-    fn start_ensure(self: &Arc<Self>, roots: &[StorePath], prefetch: bool) -> Ensuring {
-        let (this, roots) = (self.clone(), roots.to_vec());
+    fn start_ensure(self: &Arc<Self>, wanted: Wanted, prefetch: bool) -> Ensuring {
+        let this = self.clone();
         let progress = Arc::<OnceLock<_>>::default();
         let resolved = Arc::<AtomicUsize>::default();
         let (set, count) = (progress.clone(), resolved.clone());
         let (tx, rx) = oneshot::channel();
         self.ensures.fetch_add(1, Ordering::Relaxed);
         let ensure = async move {
-            let result = this.ensure_closure(&roots, prefetch, &set, &count).await;
+            let result = this.ensure_closure(&wanted, prefetch, &set, &count).await;
             this.ensures.fetch_sub(1, Ordering::Relaxed);
             // From here on, only the caller's hold makes collection spare the
             // closure.
             drop(set);
             if let Err(Err(e)) = tx.send(result) {
-                warn!(store_paths = %Names(&roots), "{e:#}; no publish is waiting any more");
+                warn!(closure = %wanted, "{e:#}; no publish is waiting any more");
             }
         };
         // The closure's lookups log in the caller's span.
@@ -77,13 +125,23 @@ impl Store {
 
     async fn ensure_closure(
         self: &Arc<Self>,
-        roots: &[StorePath],
+        wanted: &Wanted,
         prefetch: bool,
         progress: &OnceLock<Fetching>,
         resolved: &AtomicUsize,
-    ) -> anyhow::Result<Arc<[StorePath]>> {
+    ) -> anyhow::Result<Ensured> {
         let installs = self.installs.load(Ordering::SeqCst);
-        let closure = self.caches.resolve(roots, resolved).await?;
+        let (roots, closure) = match wanted {
+            Wanted::StorePaths(roots) => {
+                (roots.clone(), self.caches.resolve(roots, resolved).await?)
+            }
+            Wanted::Artifact(reference) => {
+                let system = store_path::system();
+                let store_dir = self.caches.store_dir();
+                let artifact = self.registries.fetch(reference, &system, store_dir).await?;
+                self.caches.resolve_artifact(artifact)?
+            }
+        };
         let total: u64 = closure.values().map(|e| e.info.nar_size()).sum();
         let paths: Arc<[StorePath]> = closure.keys().cloned().collect();
         // Under the guard, a collection either sees the hold or finishes
@@ -128,7 +186,7 @@ impl Store {
         // closure in the store, so they stay quiet.
         let logs = started > 0;
         let present = paths.len() - missing.len();
-        let (store_paths, start) = (Names(roots), Instant::now());
+        let (store_paths, start) = (Names(&roots), Instant::now());
         if logs {
             info!(%store_paths, fetching = missing.len(), present, nar_size = fetching, "fetching the closure");
         }
@@ -157,7 +215,7 @@ impl Store {
             let elapsed_ms = start.elapsed().as_millis();
             info!(%store_paths, fetched = missing.len(), nar_size = fetching, elapsed_ms, "fetched the closure");
         }
-        Ok(paths)
+        Ok(Ensured { roots, paths })
     }
 
     /// Fails unless `paths` holds every reference of each store object in it.
@@ -266,22 +324,27 @@ impl Store {
         self.flush().await?;
         let mut tried = Vec::new();
         loop {
-            // The node store had the narinfo but no longer has the path.
-            let Some(cache) = entry.cache else {
-                entry = (self.caches.next(&entry, &tried).await)
-                    .and_then(|next| next.context("no cache has it"))
-                    .with_context(|| format!("fetching {path}"))?;
-                continue;
+            let source = match (&entry.registry, entry.cache) {
+                (Some(repository), _) => Source::Registry(repository.clone()),
+                (None, Some(cache)) => {
+                    tried.push(cache);
+                    Source::Cache(cache)
+                }
+                // The node store had the narinfo but no longer has the path.
+                (None, None) => {
+                    entry = (self.caches.next(&entry, &tried).await)
+                        .and_then(|next| next.context("no cache has it"))
+                        .with_context(|| format!("fetching {path}"))?;
+                    continue;
+                }
             };
-            tried.push(cache);
             let started = Instant::now();
-            let fetched = self.fetch(cache, &entry, bytes).await;
-            (self.metrics).nar_fetch(
-                self.caches.name(cache),
-                fetched.is_ok(),
-                started,
-                entry.info.nar_size(),
-            );
+            let fetched = self.fetch(&source, &entry, bytes).await;
+            let label = match &source {
+                Source::Cache(cache) => self.caches.name(*cache),
+                Source::Registry(repository) => &repository.host,
+            };
+            (self.metrics).nar_fetch(label, fetched.is_ok(), started, entry.info.nar_size());
             let error = match fetched {
                 Ok(()) => return Ok(true),
                 Err(e) => e.context(format!("fetching {path}")),
@@ -304,21 +367,31 @@ impl Store {
     /// Its narinfo stays unsynced until [`Store::sync`].
     async fn fetch(
         self: &Arc<Self>,
-        cache: usize,
+        source: &Source,
         entry: &Arc<Entry>,
         bytes: &Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
         let info = &entry.info;
-        let name = self.caches.name(cache);
+        let name = match source {
+            Source::Cache(cache) => self.caches.name(*cache),
+            Source::Registry(repository) => &repository.name,
+        };
         let url = transport::request_url(name, info.url())
             .map_or_else(|_| info.url().to_owned(), |url| url.to_string());
         debug!(cache = %name, %url, nar_size = info.nar_size(), "fetching NAR");
         let failed_syncs = self.failed_syncs.load(Ordering::SeqCst);
         let base = info.path().to_string();
         let part = (|| async {
-            let body = (self.caches)
-                .stream(cache, info.url(), info.compression)
-                .await?;
+            let body = match source {
+                Source::Cache(cache) => {
+                    (self.caches)
+                        .stream(*cache, info.url(), info.compression)
+                        .await?
+                }
+                Source::Registry(repository) => {
+                    repository.stream(info.url(), info.compression).await?
+                }
+            };
             let part = Scratch::new_in(&self.tmp)?;
             let dest = part.path().join(&base);
             let unpacked = self.sandbox.spawn(unpack_nar(
@@ -392,7 +465,7 @@ impl Drop for Leave {
 /// A closure on its way into the store, from [`Store::ensure`] or
 /// [`Store::prefetch`].
 pub struct Ensuring {
-    result: oneshot::Receiver<anyhow::Result<Arc<[StorePath]>>>,
+    result: oneshot::Receiver<anyhow::Result<Ensured>>,
     /// The narinfos resolution has so far.
     resolved: Arc<AtomicUsize>,
     progress: Arc<OnceLock<Fetching>>,
@@ -441,6 +514,11 @@ impl Drop for Held {
 impl Ensuring {
     /// Returns the closure's paths once they're all in the store.
     pub async fn done(&mut self) -> anyhow::Result<Arc<[StorePath]>> {
+        self.closure().await.map(|closure| closure.paths)
+    }
+
+    /// Like [`Ensuring::done`], with the closure's roots.
+    pub async fn closure(&mut self) -> anyhow::Result<Ensured> {
         (&mut self.result).await?
     }
 
@@ -675,32 +753,13 @@ mod tests {
     use super::*;
     use crate::metrics::tests::sample;
     use crate::narinfo::tests::{
-        encode, file_store, fixture_narinfo, fixture_path, fixture_root, fixtures, without_lines,
-        write_narinfos,
+        encode, file_nar, file_store, fixture_narinfo, fixture_path, fixture_root, fixtures,
+        without_lines, write_narinfos,
     };
     use crate::store::test_utils::*;
 
     fn sha256(data: &[u8]) -> Hash {
         Algorithm::SHA256.digest(data)
-    }
-
-    /// A NAR of one regular file.
-    fn file_nar(contents: &[u8]) -> Vec<u8> {
-        let mut nar = Vec::new();
-        for s in [
-            &b"nix-archive-1"[..],
-            b"(",
-            b"type",
-            b"regular",
-            b"contents",
-            contents,
-            b")",
-        ] {
-            nar.extend((s.len() as u64).to_le_bytes());
-            nar.extend(s);
-            nar.resize(nar.len().next_multiple_of(8), 0);
-        }
-        nar
     }
 
     /// Checks that the tree at `path` serializes to the NAR with `nar_hash`,
@@ -1126,6 +1185,7 @@ mod tests {
         let info = fixture_narinfo(&dir, "cache-zstd", &hello);
         let (fetch, _, _) = store.fetch_shared(Arc::new(Entry {
             cache: Some(1),
+            registry: None,
             info,
         }));
         let mut ensuring = store.ensure(std::slice::from_ref(&hello));
@@ -1136,5 +1196,163 @@ mod tests {
         assert!(format!("{err:#}").contains("the next try"), "{err:#}");
         // The next try finds hello in the node store, with its references.
         assert_eq!(store.ensure(&[hello]).done().await.unwrap().len(), 5);
+    }
+
+    /// A store for artifacts from `registry`, with `cache` as its cache.
+    fn artifact_store(
+        state: &Path,
+        cache: &Path,
+        registry: &oci::test_registry::Registry,
+        key: Option<&harmonia_utils_signature::SecretKey>,
+    ) -> Arc<Store> {
+        let config = crate::store::Config {
+            stores: vec![file_store(cache)],
+            trusted_keys: key.map(|k| vec![k.to_public_key()]),
+            state_dir: state.to_owned(),
+            jobs: 2,
+            netrc_file: None,
+            max_closure_size: None,
+            ensure_free: crate::store::EnsureFree::Bytes(0),
+            measure: false,
+            closure_registries: vec![registry.host.clone()],
+            insecure_registries: vec!["127.0.0.1".to_owned()],
+        };
+        Arc::new(Store::new(config).unwrap())
+    }
+
+    fn artifact(store: &Store, reference: &str) -> Wanted {
+        Wanted::Artifact(store.artifact(reference).unwrap())
+    }
+
+    #[tokio::test]
+    async fn ensures_an_artifact() {
+        use oci::test_registry::Registry;
+        let key = oci::tests::key();
+        let system = store_path::system();
+        let registry = Registry::start().await;
+        let reference =
+            oci::tests::put_closure(&registry, &[&system], Compression::Zstd, &key).await;
+        let (tmp, cache) = (scratch(), crate::narinfo::tests::empty_cache());
+        let store = artifact_store(tmp.path(), cache.path(), &registry, Some(&key));
+        let wanted = artifact(&store, &reference);
+        let blobs = || registry.requests("GET /v2/envs/app/blobs/").len();
+        let before = blobs();
+
+        let closure = store.ensure_wanted(wanted.clone()).closure().await.unwrap();
+        let objects = oci::tests::objects(&system);
+        assert_eq!(closure.roots, [objects[2].path.clone()]);
+        let mut want: Vec<_> = objects.iter().map(|o| o.path.clone()).collect();
+        want.sort();
+        assert_eq!(&*closure.paths, want);
+        let contents = std::fs::read(store.dir().join(objects[2].path.to_string())).unwrap();
+        assert_eq!(contents, format!("app for {system}").as_bytes());
+        // The config and the three NARs, with no narinfo lookups.
+        assert_eq!(blobs() - before, 4);
+        assert!(registry.requests(".narinfo").is_empty());
+        let metrics = crate::metrics::registry(&store);
+        let fetched = format!(
+            "nix_store_csi_nar_fetch_duration_seconds_count{{cache=\"oci://{}\",result=\"ok\"}}",
+            registry.host
+        );
+        assert_eq!(sample(&metrics, &fetched), Some(3.0));
+
+        // Another volume fetches only the manifest and the config.
+        let again = store.ensure_wanted(wanted).closure().await.unwrap();
+        assert_eq!(again.paths, closure.paths);
+        assert_eq!(blobs() - before, 5);
+    }
+
+    #[tokio::test]
+    async fn needs_trusted_signatures_on_artifacts() {
+        use oci::test_registry::Registry;
+        let (trusted, other) = (oci::tests::key(), oci::tests::key());
+        let system = store_path::system();
+        let cache = crate::narinfo::tests::empty_cache();
+        let registry = Registry::start().await;
+        let signed =
+            oci::tests::put_closure(&registry, &[&system], Compression::None, &trusted).await;
+        let by_other =
+            oci::tests::put_closure(&registry, &[&system], Compression::None, &other).await;
+        // Someone who can push changes a path's NarHash, which its signature
+        // covers.
+        let changed = oci::tests::edit_manifest(&registry, &signed, |m| {
+            let hash = m["layers"][0]["annotations"][oci::NAR_HASH]
+                .as_str()
+                .unwrap();
+            let hash = hash.replace(&hash[10..11], if &hash[10..11] == "0" { "1" } else { "0" });
+            m["layers"][0]["annotations"][oci::NAR_HASH] = hash.into();
+            m["layers"][0]["mediaType"] = format!("{}+zstd", oci::NAR_TYPE).into();
+        });
+        for (reference, store_key, want) in [
+            (&by_other, Some(&trusted), "has no trusted signature for"),
+            (&changed, Some(&trusted), "has no trusted signature for"),
+            // A pod picks the registry, so without keys nothing passes.
+            (&signed, None, "closure volumes need trusted public keys"),
+        ] {
+            let tmp = scratch();
+            let store = artifact_store(tmp.path(), cache.path(), &registry, store_key);
+            let before = registry.requests("GET").len();
+            let err = (store.ensure_wanted(artifact(&store, reference)).done())
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains(want), "{want}: {err:#}");
+            // Only the manifest and the config, no NAR.
+            assert_eq!(registry.requests("GET").len() - before, 2, "{want}");
+            assert_eq!(count(store.dir()), 0);
+        }
+    }
+
+    /// A NAR that doesn't match its `NarHash` fails, compressed or not, and
+    /// falls back only to a cache with the same `NarHash`.
+    #[tokio::test]
+    async fn checks_nars_from_artifacts() {
+        use oci::test_registry::Registry;
+        let key = oci::tests::key();
+        let system = store_path::system();
+        let objects = oci::tests::objects(&system);
+        let shared = &objects[0];
+        for compression in [Compression::None, Compression::Zstd] {
+            let registry = Registry::start().await;
+            let reference = oci::tests::put_closure(&registry, &[&system], compression, &key).await;
+            // The registry serves other bytes for `shared`'s layer.
+            let evil = oci::tests::compress(&file_nar(b"evil!!"), compression).await;
+            let blob = format!(
+                "/v2/{}/blobs/{}",
+                oci::tests::NAME,
+                oci::tests::digest_of(&oci::tests::compress(&shared.nar, compression).await)
+            );
+            assert!(registry.get(&blob).is_some());
+            registry.put(blob, "application/octet-stream", evil);
+            let tmp = scratch();
+            let cache = crate::narinfo::tests::empty_cache();
+            let store = artifact_store(tmp.path(), cache.path(), &registry, Some(&key));
+            let err = (store.ensure_wanted(artifact(&store, &reference)).done())
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("NAR hash mismatch"), "{err:#}");
+            assert!(!store.present(&shared.path));
+
+            // A cache with another NAR for the path doesn't stand in for the
+            // registry. One with the same NAR does.
+            let other = oci::tests::Object {
+                path: shared.path.clone(),
+                nar: file_nar(b"another shared"),
+                references: Vec::new(),
+            };
+            let narinfo = cache.path().join(format!("{}.narinfo", shared.path.hash()));
+            std::fs::create_dir_all(cache.path().join("nar")).unwrap();
+            for (object, works) in [(&other, false), (shared, true)] {
+                let text = oci::tests::narinfo_text(object, Compression::None, Some(&key));
+                std::fs::write(&narinfo, text).unwrap();
+                let file = format!("nar/{}.nar.none", shared.path.hash());
+                std::fs::write(cache.path().join(file), &object.nar).unwrap();
+                let done = store
+                    .ensure_wanted(artifact(&store, &reference))
+                    .done()
+                    .await;
+                assert_eq!(done.is_ok(), works, "{compression:?} {done:?}");
+            }
+            assert!(store.present(&shared.path));
+        }
     }
 }

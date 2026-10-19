@@ -23,7 +23,8 @@ use crate::csi::Plugin;
 use crate::csi::proto::identity_server::IdentityServer;
 use crate::csi::proto::node_server::NodeServer;
 use crate::narinfo::{NarInfo, PublicKey};
-use crate::store::{Config, EnsureFree, Excess, Store};
+use crate::oci::Registries;
+use crate::store::{Config, EnsureFree, Excess, Store, Wanted};
 
 mod cli;
 mod closure;
@@ -31,6 +32,7 @@ mod csi;
 mod metrics;
 mod mounts;
 mod narinfo;
+mod oci;
 mod prefetch;
 mod store;
 mod store_path;
@@ -95,10 +97,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if trusted_keys.is_empty() && !cli.no_require_sigs {
         bail!("no trusted public keys given; pass --no-require-sigs to accept unsigned narinfos");
     }
-    let stores: Vec<_> = (cli.substituters.split_whitespace())
-        .map(str::to_owned)
-        .collect();
-    if stores.is_empty() {
+    let list = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+    let stores = list(&cli.substituters);
+    let closure_registries = list(&cli.closure_registries);
+    // A node that only mounts `closure` volumes needs no cache.
+    if stores.is_empty() && closure_registries.is_empty() {
         bail!("no substituters given");
     }
     let config = Config {
@@ -110,6 +113,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         max_closure_size: None,
         ensure_free: EnsureFree::Bytes(0),
         measure: false,
+        closure_registries,
+        insecure_registries: list(&cli.insecure_registries),
     };
     match cli.command {
         Command::Unpack { roots, dry_run } => unpack(config, &roots, dry_run).await,
@@ -154,7 +159,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 /// With `dry_run`, it only resolves them against the caches and prints their
 /// size, without opening the state dir.
 async fn unpack(config: Config, roots: &[String], dry_run: bool) -> anyhow::Result<()> {
-    let roots = store_path::roots(roots.iter().map(String::as_str))?;
+    let registries = Registries::new(
+        config.closure_registries.clone(),
+        config.insecure_registries.clone(),
+    );
+    let wanted = match roots {
+        [one] if one.starts_with("oci://") => Wanted::Artifact(registries.parse(one)?),
+        _ => Wanted::StorePaths(store_path::roots(roots.iter().map(String::as_str))?),
+    };
     if dry_run {
         let caches = Caches::new(
             &config.stores,
@@ -163,12 +175,23 @@ async fn unpack(config: Config, roots: &[String], dry_run: bool) -> anyhow::Resu
             None,
             config.netrc_file.as_deref(),
         )?;
-        let closure = caches.resolve(&roots, &AtomicUsize::default()).await?;
+        let closure = match &wanted {
+            Wanted::StorePaths(roots) => caches.resolve(roots, &AtomicUsize::default()).await?,
+            Wanted::Artifact(reference) => {
+                let artifact = (registries)
+                    .fetch(reference, &store_path::system(), caches.store_dir())
+                    .await?;
+                caches.resolve_artifact(artifact)?.1
+            }
+        };
         println!("{}", closure_size(closure.values().map(|e| &e.info)));
         return Ok(());
     }
     let store = Arc::new(Store::new(config)?);
-    let mut ensuring = store.ensure(&roots);
+    let mut ensuring = match wanted {
+        Wanted::StorePaths(roots) => store.ensure(&roots),
+        wanted @ Wanted::Artifact(_) => store.ensure_wanted(wanted),
+    };
     loop {
         if let Ok(result) = tokio::time::timeout(UNPACK_PROGRESS, ensuring.done()).await {
             result?;

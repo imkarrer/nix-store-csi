@@ -47,6 +47,31 @@ pub struct Cli {
     )]
     pub netrc_file: Option<PathBuf>,
 
+    /// OCI registry hosts, like `registry.local` or `registry.local:5000`, to
+    /// reach over plain HTTP instead of HTTPS.
+    #[arg(
+        long,
+        value_name = "HOSTS",
+        env = "NIX_STORE_CSI_INSECURE_REGISTRIES",
+        default_value = "",
+        hide_default_value = true,
+        global = true
+    )]
+    pub insecure_registries: String,
+
+    /// Registries that `closure` volumes may name, as `host[:port]`, or
+    /// `host[:port]/<prefix>` for the repositories under a prefix. Empty turns
+    /// `closure` volumes off.
+    #[arg(
+        long,
+        value_name = "LIST",
+        env = "NIX_STORE_CSI_CLOSURE_REGISTRIES",
+        default_value = "",
+        hide_default_value = true,
+        global = true
+    )]
+    pub closure_registries: String,
+
     /// Directory that holds the node store in `store/`.
     #[arg(
         long,
@@ -160,7 +185,8 @@ pub enum Command {
     /// Fetch the closures of store paths into the node store and print its
     /// directory, for use with `podman -v DIR:/nix/store:ro`.
     Unpack {
-        /// Store paths, their base names, or paths inside them.
+        /// Store paths, their base names, or paths inside them. Or one
+        /// `oci://<host>/<name>@sha256:<digest>` artifact.
         #[arg(value_name = "STORE_PATH", required = true)]
         roots: Vec<String>,
         /// Only look up the closures in the caches and print their size, or

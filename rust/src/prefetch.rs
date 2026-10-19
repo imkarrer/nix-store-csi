@@ -252,6 +252,9 @@ mod tests {
             max_closure_size: Some(1),
             ensure_free: crate::store::EnsureFree::Bytes(0),
             measure: true,
+
+            closure_registries: Vec::new(),
+            insecure_registries: Vec::new(),
         });
         Prefetch::new(Arc::new(store.unwrap()), dir.to_owned())
     }

@@ -44,6 +44,9 @@ pub(super) fn config(fixtures: &Path, cache: &Path, state: &Path) -> Config {
         max_closure_size: None,
         ensure_free: EnsureFree::Bytes(1 << 30),
         measure: true,
+
+        closure_registries: Vec::new(),
+        insecure_registries: Vec::new(),
     }
 }
 
