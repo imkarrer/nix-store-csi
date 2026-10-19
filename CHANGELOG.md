@@ -26,6 +26,24 @@
 ### Added
 
 - `--gc-interval` sets how often collection runs, 10 minutes by default.
+- The `closure` volume attribute, and `closure.<system>`, in place of
+  `storePaths`. It names, by digest, an OCI index or manifest that has a
+  layer for each store path's NAR, and the plugin fetches the closure from
+  the registry. Each path still needs a trusted signature.
+  [OCI.md](docs/OCI.md) describes the format.
+- `--closure-registries` and the chart's `closureRegistries` list the
+  registries that `closure` volumes may name. It is empty by default, which
+  turns `closure` volumes off. With registries in it, `substituters` may be
+  empty.
+- `--insecure-registries` and the chart's `insecureRegistries`, registry
+  hosts that the plugin reads over plain HTTP.
+- `--registry-credentials` and the chart's `registryCredentialsSecret`, a
+  Docker config with logins for registries.
+- The chart's `extraCACertificates`, a ConfigMap of CA certificates that the
+  plugin trusts besides the image's.
+- `nix-store-csi push` puts the closures of store paths from the caches in a
+  registry, with an index for several systems, and prints the reference.
+- `unpack` takes an `oci://` reference.
 
 ## 0.1.6 - 2026-10-16
 

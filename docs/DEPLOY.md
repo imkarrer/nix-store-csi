@@ -131,6 +131,49 @@ trustedPublicKeys:
 s3CredentialsSecret: r2-credentials
 ```
 
+### Registries
+
+`closure` volumes, see [PODS.md](PODS.md#closures-from-a-registry), are off
+until `closureRegistries` lists the registries they may name. An entry is a
+host, with a port if it isn't 443, and optionally a repository prefix:
+
+```yaml
+# values.yaml
+closureRegistries:
+  - registry.example.com/nix-closures
+  - registry.registry.svc:5000
+# Only for registries that serve plain HTTP, like one in the cluster.
+insecureRegistries:
+  - registry.registry.svc
+# Logins, in a Secret of type kubernetes.io/dockerconfigjson.
+registryCredentialsSecret: registry-login
+```
+
+- The Secret has the format of an image pull Secret, so
+  `kubectl create secret docker-registry` makes one. The plugin reads it for
+  every request, so changes apply without a restart. It sends the login to
+  the registry's host, and gets a token where the registry asks for one.
+  Public repositories need no Secret.
+- The paths in an artifact need signatures by `trustedPublicKeys`, as from a
+  cache, so with `--no-require-sigs` the plugin refuses `closure` volumes.
+- With `closureRegistries`, `substituters` may be empty. The nodes then need
+  no binary cache, only the registries.
+
+### Private CAs
+
+`extraCACertificates` names a ConfigMap in the plugin's namespace whose keys
+are PEM certificates. The plugin trusts them besides the image's CA
+certificates, for registries and caches:
+
+```sh
+kubectl -n kube-system create configmap company-ca --from-file=ca.crt
+```
+
+```yaml
+# values.yaml
+extraCACertificates: company-ca
+```
+
 ### Prefetching
 
 To have closures on the nodes before pods need them, list their store paths
@@ -234,6 +277,11 @@ volumes. So anyone who can create a pod in any namespace can mount the closure
 of any store path that the configured caches serve. That includes private
 caches that the plugin reaches with the netrc Secret or a service account
 token.
+
+With `closure` volumes, such pods can also make a node fetch from the
+registries in `closureRegistries`. A pod can't add content to the node store
+that `trustedPublicKeys` didn't sign. An admission policy can check the
+`closure` attribute, which names the registry and the digest.
 
 Pods can ask for store paths whose closures are any size. A node fetches the
 closure of every pod it runs, and the fetch goes on after the pod is gone.
