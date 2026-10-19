@@ -1,0 +1,33 @@
+# Admits `closure` volumes in the demo namespace only from registry B, and only
+# pinned by digest.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: closures-from-registry-b
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+  validations:
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v,
+          !has(v.csi) || !has(v.csi.volumeAttributes) || v.csi.volumeAttributes.all(k,
+            !k.startsWith('closure') ||
+            v.csi.volumeAttributes[k].matches('^oci://registry-b[.]registries[.]svc/[^@]+@sha256:[0-9a-f]{64}$')))
+      message: closure volumes must come from registry-b.registries.svc, pinned by digest
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: closures-from-registry-b
+spec:
+  policyName: closures-from-registry-b
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: demo
