@@ -32,13 +32,14 @@ pub fn system() -> String {
     format!("{}-linux", std::env::consts::ARCH)
 }
 
-/// Returns the attribute that lists the store paths for `system`, and its
+/// Returns the attribute `name`, like [`STORE_PATHS`], for `system`, and its
 /// value.
 pub fn for_system<'a>(
     attributes: &'a HashMap<String, String>,
+    name: &str,
     system: &str,
 ) -> Option<(String, &'a str)> {
-    [format!("{STORE_PATHS}.{system}"), STORE_PATHS.to_owned()]
+    [format!("{name}.{system}"), name.to_owned()]
         .into_iter()
         .find_map(|attribute| {
             let value = attributes.get(&attribute)?;
