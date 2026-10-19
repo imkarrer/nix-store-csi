@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- A request over HTTPS to a server that answers in plain HTTP fails at once.
+  Before, it retried for a minute.
 - A 403 from S3 or GCS counts as a missing file only with the code
   `AccessDenied`. Others, like `SignatureDoesNotMatch` or
   `RequestTimeTooSkewed`, are errors, so wrong credentials no longer look
