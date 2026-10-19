@@ -344,6 +344,12 @@ async fn check_status(mut resp: reqwest::Response) -> Result<reqwest::Response, 
     })
 }
 
+/// Fails for a status other than 200, with what the server said, like a
+/// request of [`Transport::get`]. A 401 fails with its challenge.
+pub async fn check_response(resp: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+    check_status(resp).await.map_err(|f| f.error)
+}
+
 /// Whether a retry may get another answer than `status`. As in Nix, 501 and
 /// 505 don't count, and neither does 511, which captive portals send.
 fn is_transient(status: StatusCode) -> bool {
@@ -571,6 +577,43 @@ impl Transport {
             client: client()?,
             auth: Some(Auth::Registry(credentials)),
         }))
+    }
+
+    /// A request with the registry's credentials, for pushing to a
+    /// repository from [`Transport::registry`]. `path` is relative to its
+    /// base, or an absolute URL, like an upload's `Location`, on the same
+    /// host.
+    pub fn registry_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> anyhow::Result<(Url, reqwest::RequestBuilder)> {
+        let Self::Http(Http {
+            base,
+            client,
+            auth: Some(Auth::Registry(credentials)),
+        }) = self
+        else {
+            bail!("not a registry");
+        };
+        let url = match Url::parse(path) {
+            Ok(url) => url,
+            // Like `blobs/uploads/`, or a `Location` without the host.
+            Err(url::ParseError::RelativeUrlWithoutBase) => {
+                ensure!(
+                    !path.split(['/', '?']).any(|c| c == ".."),
+                    "bad path for the registry: {path:?}"
+                );
+                base.join(path)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        ensure!(
+            url[..Position::BeforePath] == base[..Position::BeforePath],
+            "the registry sent a URL on another host"
+        );
+        let request = credentials.authorize(client.request(method, url.clone()), &url)?;
+        Ok((url, request))
     }
 
     /// A small file like a narinfo, or `None` if the cache hasn't got it.

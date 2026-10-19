@@ -74,6 +74,7 @@ pub struct Cli {
 
     /// Docker config file with logins for registries, like the
     /// `.dockerconfigjson` of an image pull Secret, read on every request.
+    /// `push` defaults to Docker's own.
     #[arg(
         long,
         value_name = "FILE",
@@ -204,6 +205,17 @@ pub enum Command {
         /// use the state dir.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Push the closures of store paths from the caches to a registry, as an
+    /// artifact for `closure` volumes, and print the reference that pins it.
+    Push {
+        /// `oci://<host>/<name>`, with an optional `:<tag>`.
+        #[arg(value_name = "TARGET")]
+        target: String,
+        /// Store paths for this machine's system, or `<system>=<store path>`
+        /// for others. Several systems get an index.
+        #[arg(value_name = "STORE_PATH", required = true)]
+        roots: Vec<String>,
     },
 }
 

@@ -1,9 +1,11 @@
 //! Closures from OCI registries. A volume's `closure` attribute pins an
 //! artifact by digest. Its config names the roots, and it has a layer for each
 //! store path in the closure: the path's NAR, with the rest of its narinfo as
-//! annotations. [`docs/OCI.md`](../../../docs/OCI.md) describes the format.
+//! annotations. [`docs/OCI.md`](../../../docs/OCI.md) describes the format,
+//! and [`push`] writes it.
 
 mod auth;
+pub mod push;
 #[cfg(test)]
 pub(crate) mod test_registry;
 
@@ -64,7 +66,7 @@ impl std::fmt::Display for Reference {
     }
 }
 
-/// The settings for reading artifacts from registries.
+/// The settings for reading and writing artifacts in registries.
 pub struct Registries {
     /// `host[:port][/<repository prefix>]` that `closure` volumes may name.
     allowed: Vec<String>,
@@ -74,7 +76,7 @@ pub struct Registries {
     credentials: Option<PathBuf>,
 }
 
-/// A repository that NARs come from.
+/// A repository that NARs come from, or that `push` writes.
 pub struct Repository {
     /// `oci://<host>/<name>`, for messages.
     pub name: Url,
@@ -173,10 +175,11 @@ struct Config {
     system: Option<String>,
 }
 
-/// The parts of `oci://<host>/<name>[:<tag>][@<digest>]`, without the tag.
+/// The parts of `oci://<host>/<name>[:<tag>][@<digest>]`.
 struct Parts<'a> {
     host: &'a str,
     name: &'a str,
+    tag: Option<&'a str>,
     digest: Option<&'a str>,
 }
 
@@ -210,7 +213,12 @@ fn parts(reference: &str) -> anyhow::Result<Parts<'_>> {
     if let Some(digest) = digest {
         check_digest(digest).with_context(|| format!("parsing {reference:?}"))?;
     }
-    Ok(Parts { host, name, digest })
+    Ok(Parts {
+        host,
+        name,
+        tag,
+        digest,
+    })
 }
 
 impl Registries {
@@ -239,11 +247,18 @@ impl Registries {
         Ok(base)
     }
 
-    fn repository(&self, host: &str, name: &str, base: &Url) -> anyhow::Result<Repository> {
+    /// `scope` is what the token service grants, `pull` or `pull,push`.
+    fn repository(
+        &self,
+        host: &str,
+        name: &str,
+        base: &Url,
+        scope: &str,
+    ) -> anyhow::Result<Repository> {
         let credentials = Arc::new(Credentials::new(
             self.credentials.clone(),
             host,
-            format!("repository:{name}:pull"),
+            format!("repository:{name}:{scope}"),
             self.insecure.clone(),
         ));
         Ok(Repository {
@@ -308,7 +323,8 @@ impl Registries {
         system: &str,
         store_dir: &StoreDir,
     ) -> anyhow::Result<Artifact> {
-        let repository = self.repository(&reference.host, &reference.name, &reference.base)?;
+        let repository =
+            self.repository(&reference.host, &reference.name, &reference.base, "pull")?;
         let get = |digest: &str| {
             let digest = digest.to_owned();
             let repository = &repository;
@@ -511,6 +527,14 @@ fn oci_arch(system: &str) -> anyhow::Result<&'static str> {
     })
 }
 
+/// The media type of a NAR layer with `compression`.
+pub fn nar_type(compression: Compression) -> String {
+    match compression {
+        Compression::None => NAR_TYPE.to_owned(),
+        c => format!("{NAR_TYPE}+{}", c.name()),
+    }
+}
+
 /// The compression of a NAR layer of `media_type`.
 fn compression(media_type: &str) -> anyhow::Result<Compression> {
     match media_type.strip_prefix(NAR_TYPE) {
@@ -638,7 +662,8 @@ pub(crate) mod tests {
 
     use super::test_registry::{Login, PASSWORD, Registry, USER};
     use super::*;
-    use crate::narinfo::tests::{file_nar, sign};
+    use crate::closure::Caches;
+    use crate::narinfo::tests::{empty_cache, file_nar, file_store, sign};
 
     pub const NAME: &str = "envs/app";
 
@@ -725,14 +750,6 @@ pub(crate) mod tests {
             writeln!(text, "Sig: {}", sign(&info, key)).unwrap();
         }
         text
-    }
-
-    /// The media type of a NAR layer with `compression`.
-    pub fn nar_type(compression: Compression) -> String {
-        match compression {
-            Compression::None => NAR_TYPE.to_owned(),
-            c => format!("{NAR_TYPE}+{}", c.name()),
-        }
     }
 
     /// Puts `content` in `registry` as a blob and returns its descriptor.
@@ -838,6 +855,63 @@ pub(crate) mod tests {
             }
         };
         format!("oci://{}/{NAME}@{digest}", registry.host)
+    }
+
+    /// A binary cache with `objects`, their NARs compressed with
+    /// `compression`, signed by `key` if given.
+    pub async fn cache(
+        objects: &[Object],
+        compression: Compression,
+        key: Option<&SecretKey>,
+    ) -> tempfile::TempDir {
+        let dir = empty_cache();
+        std::fs::create_dir_all(dir.path().join("nar")).unwrap();
+        for object in objects {
+            let file = format!("nar/{}.nar.{}", object.path.hash(), compression.name());
+            let nar = compress(&object.nar, compression).await;
+            std::fs::write(dir.path().join(file), nar).unwrap();
+            let narinfo = dir.path().join(format!("{}.narinfo", object.path.hash()));
+            std::fs::write(narinfo, narinfo_text(object, compression, key)).unwrap();
+        }
+        dir
+    }
+
+    pub fn caches(cache: &Path, key: Option<&SecretKey>) -> Caches {
+        Caches::new(
+            &[file_store(cache)],
+            StoreDir::default(),
+            key.map(|k| vec![k.to_public_key()]),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Pushes the closure of `app` for each of `systems` from a cache of
+    /// `compression` to `registry`, and returns the reference.
+    pub async fn push_closure(
+        registry: &Registry,
+        credentials: Option<&Path>,
+        systems: &[&str],
+        compression: Compression,
+        key: &SecretKey,
+    ) -> String {
+        let objects: Vec<_> = systems.iter().flat_map(|s| objects(s)).collect();
+        let cache = cache(&objects, compression, Some(key)).await;
+        let roots: Vec<_> = (systems.iter())
+            .map(|s| ((*s).to_owned(), self::objects(s)[2].path.clone()))
+            .collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let target = format!("oci://{}/{NAME}:latest", registry.host);
+        push::push(
+            &caches(cache.path(), Some(key)),
+            &logged_in(registry, credentials),
+            &target,
+            &roots,
+            tmp.path(),
+        )
+        .await
+        .unwrap()
     }
 
     /// Changes the manifest of `reference` with `edit`, puts it under its new
@@ -1170,6 +1244,132 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn pushes_and_reads_a_manifest() {
+        let key = key();
+        let system = "aarch64-linux";
+        for compression in [Compression::None, Compression::Zstd, Compression::Xz] {
+            let registry = Registry::start(Login::None).await;
+            let reference = push_closure(&registry, None, &[system], compression, &key).await;
+            let tag = registry
+                .get(&format!("/v2/{NAME}/manifests/latest"))
+                .unwrap();
+            assert_eq!(reference.rsplit_once('@').unwrap().1, super::digest(&tag));
+            let artifact = fetch(&registries(&registry), &reference, system)
+                .await
+                .unwrap();
+            let objects = objects(system);
+            assert_eq!(artifact.roots, [objects[2].path.clone()]);
+            assert_eq!(
+                artifact.repository.name.as_str(),
+                format!("oci://{}/{NAME}", registry.host)
+            );
+            let mut layers = artifact.layers;
+            layers.sort_by(|a, b| a.path().cmp(b.path()));
+            let mut objects = objects;
+            objects.sort_by(|a, b| a.path.cmp(&b.path));
+            for (info, object) in layers.iter_mut().zip(&objects) {
+                assert_eq!(info.path(), &object.path);
+                assert_eq!(info.compression, compression);
+                assert_eq!(info.nar_size(), object.nar.len() as u64);
+                assert_eq!(info.nar_hash(), Algorithm::SHA256.digest(&object.nar));
+                let blob = registry.get(&format!("/v2/{NAME}/{}", info.url())).unwrap();
+                assert_eq!(
+                    blob,
+                    compress(&object.nar, compression).await,
+                    "{compression:?}"
+                );
+                let mut want = object.references.clone();
+                want.sort();
+                assert_eq!(info.references().iter().cloned().collect::<Vec<_>>(), want);
+                assert!(info.check_signatures(&[key.to_public_key()]).is_ok());
+            }
+            // The manifest and the config, and no narinfos.
+            assert_eq!(registry.requests("GET").len(), 2, "{:?}", registry.log);
+        }
+    }
+
+    #[tokio::test]
+    async fn pushes_an_index_for_two_systems() {
+        let key = key();
+        let registry = Registry::start(Login::None).await;
+        let systems = ["x86_64-linux", "aarch64-linux"];
+        let reference = push_closure(&registry, None, &systems, Compression::Zstd, &key).await;
+        let digest = reference.rsplit_once('@').unwrap().1;
+        let index: Value = serde_json::from_slice(
+            &registry
+                .get(&format!("/v2/{NAME}/manifests/{digest}"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index["mediaType"], INDEX_TYPE);
+        let platforms: Vec<_> = (index["manifests"].as_array().unwrap().iter())
+            .map(|m| m["platform"]["architecture"].as_str().unwrap())
+            .collect();
+        assert_eq!(platforms, ["arm64", "amd64"]);
+        for system in systems {
+            let artifact = fetch(&registries(&registry), &reference, system)
+                .await
+                .unwrap();
+            assert_eq!(
+                artifact.roots,
+                [objects(system)[2].path.clone()],
+                "{system}"
+            );
+            assert_eq!(artifact.layers.len(), 3);
+        }
+        // `shared` went up once, and every other NAR and config once.
+        assert_eq!(
+            registry.requests("PUT /v2/envs/app/blobs/uploads/").len(),
+            5 + 2
+        );
+        // Pushing again uploads nothing.
+        push_closure(&registry, None, &systems, Compression::Zstd, &key).await;
+        assert_eq!(
+            registry.requests("PUT /v2/envs/app/blobs/uploads/").len(),
+            7
+        );
+        assert!(registry.requests("HEAD").len() >= 7 + 7);
+    }
+
+    #[tokio::test]
+    async fn pushes_with_a_login() {
+        let key = key();
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = Registry::start(Login::Basic).await;
+        let good = self::login(tmp.path(), &registry, PASSWORD);
+        let reference = push_closure(
+            &registry,
+            Some(&good),
+            &["aarch64-linux"],
+            Compression::None,
+            &key,
+        )
+        .await;
+        let registries = logged_in(&registry, Some(&good));
+        assert!(
+            fetch(&registries, &reference, "aarch64-linux")
+                .await
+                .is_ok()
+        );
+
+        let objects = objects("aarch64-linux");
+        let cache = cache(&objects, Compression::None, Some(&key)).await;
+        let bad = self::login(tmp.path(), &registry, "wrong");
+        let roots = [("aarch64-linux".to_owned(), objects[2].path.clone())];
+        let target = format!("oci://{}/{NAME}:other", registry.host);
+        let e = push::push(
+            &caches(cache.path(), Some(&key)),
+            &logged_in(&registry, Some(&bad)),
+            &target,
+            &roots,
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("refused the login"), "{e:#}");
+    }
+
+    #[tokio::test]
     async fn rejects_wrong_digests() {
         let key = key();
         let system = "aarch64-linux";
@@ -1322,6 +1522,57 @@ pub(crate) mod tests {
             msg.contains("is for x86_64-linux, not this node's aarch64-linux"),
             "{msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn push_needs_trusted_signatures() {
+        let key = key();
+        let registry = Registry::start(Login::None).await;
+        let objects = objects("aarch64-linux");
+        let unsigned = cache(&objects, Compression::None, None).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = format!("oci://{}/{NAME}", registry.host);
+        let roots = [("aarch64-linux".to_owned(), objects[2].path.clone())];
+        let registries = registries(&registry);
+        let e = push::push(
+            &caches(unsigned.path(), Some(&key)),
+            &registries,
+            &target,
+            &roots,
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("with a trusted signature"),
+            "{e:#}"
+        );
+        let e = push::push(
+            &caches(unsigned.path(), None),
+            &registries,
+            &target,
+            &roots,
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("push needs trusted public keys"),
+            "{e:#}"
+        );
+        let pinned = format!("{target}@sha256:{}", "a".repeat(64));
+        let signed = cache(&objects, Compression::None, Some(&key)).await;
+        let e = push::push(
+            &caches(signed.path(), Some(&key)),
+            &registries,
+            &pinned,
+            &roots,
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("not to a digest"), "{e:#}");
+        assert!(registry.requests("PUT").is_empty());
     }
 
     /// The plain HTTP registry works only once its host is listed. Over

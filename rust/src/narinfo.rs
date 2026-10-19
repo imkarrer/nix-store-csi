@@ -80,6 +80,9 @@ impl Compression {
 pub struct NarInfo {
     pub compression: Compression,
     parsed: harmonia_store_nar_info::NarInfo,
+    /// The signatures by trusted keys, which [`NarInfo::check_signatures`]
+    /// keeps for `push`, as `<key name>:<base64>`.
+    trusted: Vec<String>,
 }
 
 impl NarInfo {
@@ -99,6 +102,7 @@ impl NarInfo {
         Ok(Self {
             compression,
             parsed,
+            trusted: Vec::new(),
         })
     }
 
@@ -134,8 +138,15 @@ impl NarInfo {
         &self.parsed.info.info.references
     }
 
-    /// Checks that one of `keys` signed it, and drops its signatures. If none
-    /// did, returns the names of the keys that did.
+    /// The signatures that [`NarInfo::check_signatures`] found valid, as
+    /// `<key name>:<base64>`.
+    pub fn trusted_signatures(&self) -> &[String] {
+        &self.trusted
+    }
+
+    /// Checks that one of `keys` signed it, and drops its signatures. It keeps
+    /// the valid ones apart, out of [`NarInfo::to_text`], for `push`. If none
+    /// is valid, returns the names of the keys that signed it.
     pub fn check_signatures(&mut self, keys: &[PublicKey]) -> Result<(), Vec<String>> {
         let info = &mut self.parsed.info.info;
         let signatures = std::mem::take(&mut info.signatures);
@@ -148,11 +159,16 @@ impl NarInfo {
                 &info.references,
             )
         });
-        let trusted = signatures.iter().any(|sig| {
-            keys.iter()
-                .any(|k| k.name() == sig.name() && k.verify(&*fingerprint, sig))
-        });
-        if trusted {
+        let trusted: Vec<_> = (signatures.iter())
+            .filter(|sig| {
+                keys.iter()
+                    .any(|k| k.name() == sig.name() && k.verify(&*fingerprint, sig))
+            })
+            .map(ToString::to_string)
+            .collect();
+        drop(fingerprint);
+        if !trusted.is_empty() {
+            self.trusted = trusted;
             return Ok(());
         }
         Err(signatures.iter().map(|sig| sig.name().to_owned()).collect())
@@ -384,10 +400,13 @@ Sig: test-1:uLy+NsnprYjac4dL2b/QKAqXkcZ2kMJmSWAGrfdHnRb4ycbZsCv7MMXVqp4aPJci0GM6
     #[test]
     fn writes_verified_narinfos() {
         let mut info = parse(&format!("{GLIBC}Padding: {}\n", "x".repeat(100))).unwrap();
-        assert!(
-            info.check_signatures(&[key(TEST_KEY), key(NIXOS_KEY)])
-                .is_ok()
-        );
+        assert!(info.check_signatures(&[key(TEST_KEY)]).is_ok());
+        // Only the signature by the trusted key stays, apart from the text.
+        let test_sig = GLIBC
+            .lines()
+            .find(|l| l.starts_with("Sig: test-1:"))
+            .unwrap();
+        assert_eq!(info.trusted_signatures(), [&test_sig["Sig: ".len()..]]);
         let text = String::from_utf8(info.to_text()).unwrap();
         assert_eq!(text, without_lines(GLIBC, "Sig:"));
     }

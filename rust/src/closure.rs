@@ -122,6 +122,11 @@ impl Caches {
         &self.store_dir
     }
 
+    /// Whether narinfos need a trusted signature.
+    pub fn checks_signatures(&self) -> bool {
+        self.trusted_keys.is_some()
+    }
+
     /// A bad `path` fails only the narinfo it came from and doesn't pause the
     /// cache.
     pub async fn stream(

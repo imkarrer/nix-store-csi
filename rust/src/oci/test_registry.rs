@@ -1,12 +1,12 @@
 //! A registry for the tests, with just enough of the OCI distribution API to
-//! pull: manifests and blobs by digest or tag, and logins by basic auth or by
-//! tokens from its token service.
+//! pull and push: manifests and blobs by digest or tag, monolithic uploads,
+//! and logins by basic auth or by tokens from its token service.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -14,13 +14,15 @@ use hyper::{Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+use super::digest;
+
 pub const USER: &str = "ann";
 pub const PASSWORD: &str = "s3cret";
 const TOKEN: &str = "granted-token";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Login {
-    /// Anyone may pull.
+    /// Anyone may pull and push.
     None,
     /// Every request needs [`USER`] and [`PASSWORD`] by basic auth, like a
     /// `registry:2` with htpasswd.
@@ -61,7 +63,7 @@ impl Registry {
                 let this = this.clone();
                 let service = service_fn(move |request| {
                     let this = this.clone();
-                    async move { Ok::<_, Infallible>(this.respond(&request, login)) }
+                    async move { Ok::<_, Infallible>(this.respond(request, login).await) }
                 });
                 tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(stream), service));
             }
@@ -97,12 +99,13 @@ impl Registry {
         }
     }
 
-    fn respond(&self, request: &Request<Incoming>, login: Login) -> Response<Full<Bytes>> {
-        let path = request.uri().path().to_owned();
-        let query = request.uri().query().unwrap_or_default().to_owned();
-        let method = request.method().clone();
+    async fn respond(&self, request: Request<Incoming>, login: Login) -> Response<Full<Bytes>> {
+        let (parts, body) = request.into_parts();
+        let path = parts.uri.path().to_owned();
+        let query = parts.uri.query().unwrap_or_default().to_owned();
+        let method = parts.method.clone();
         (self.log.lock().unwrap()).push(format!("{method} {path}"));
-        let authorization = (request.headers().get(header::AUTHORIZATION))
+        let authorization = (parts.headers.get(header::AUTHORIZATION))
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_owned();
@@ -140,6 +143,7 @@ impl Registry {
                 .insert(header::WWW_AUTHENTICATE, challenge.parse().unwrap());
             return response;
         }
+        let body = body.collect().await.unwrap().to_bytes().to_vec();
         match method {
             Method::GET | Method::HEAD => match self.files.lock().unwrap().get(&path) {
                 Some((content_type, content)) => {
@@ -154,6 +158,44 @@ impl Registry {
                 }
                 None => reply(StatusCode::NOT_FOUND, Vec::new()),
             },
+            Method::POST if path.ends_with("/blobs/uploads/") => {
+                let mut response = reply(StatusCode::ACCEPTED, Vec::new());
+                let location = format!("{path}upload-1?state=x");
+                response
+                    .headers_mut()
+                    .insert(header::LOCATION, location.parse().unwrap());
+                response
+            }
+            Method::PUT if path.contains("/blobs/uploads/") => {
+                let wanted = (query.split('&'))
+                    .find_map(|q| q.strip_prefix("digest="))
+                    .unwrap()
+                    .replace("%3A", ":");
+                if digest(&body) != wanted {
+                    return reply(StatusCode::BAD_REQUEST, b"DIGEST_INVALID".to_vec());
+                }
+                let name = &path[..path.find("/blobs/uploads/").unwrap()];
+                self.put(
+                    format!("{name}/blobs/{wanted}"),
+                    "application/octet-stream",
+                    body,
+                );
+                reply(StatusCode::CREATED, Vec::new())
+            }
+            Method::PUT if path.contains("/manifests/") => {
+                let content_type = (parts.headers.get(header::CONTENT_TYPE))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                let name = &path[..path.find("/manifests/").unwrap()];
+                self.put(
+                    format!("{name}/manifests/{}", digest(&body)),
+                    &content_type,
+                    body.clone(),
+                );
+                self.put(path, &content_type, body);
+                reply(StatusCode::CREATED, Vec::new())
+            }
             _ => reply(StatusCode::METHOD_NOT_ALLOWED, Vec::new()),
         }
     }

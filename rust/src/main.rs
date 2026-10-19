@@ -101,7 +101,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let stores = list(&cli.substituters);
     let closure_registries = list(&cli.closure_registries);
     // A node that only mounts `closure` volumes needs no cache.
-    if stores.is_empty() && closure_registries.is_empty() {
+    if stores.is_empty()
+        && (closure_registries.is_empty() || matches!(cli.command, Command::Push { .. }))
+    {
         bail!("no substituters given");
     }
     let config = Config {
@@ -119,6 +121,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     match cli.command {
         Command::Unpack { roots, dry_run } => unpack(config, &roots, dry_run).await,
+        Command::Push { target, roots } => push(config, &target, &roots).await,
         Command::Csi {
             endpoint,
             node_id,
@@ -204,6 +207,44 @@ async fn unpack(config: Config, roots: &[String], dry_run: bool) -> anyhow::Resu
     store.sync_all().await?;
     println!("{}", store.dir().display());
     Ok(())
+}
+
+/// Pushes the closures of `roots` from the caches to `target`, and prints the
+/// reference that pins them.
+async fn push(config: Config, target: &str, roots: &[String]) -> anyhow::Result<()> {
+    let credentials = config.registry_credentials.or_else(docker_config);
+    let registries = Registries::new(Vec::new(), config.insecure_registries, credentials);
+    let caches = Caches::new(
+        &config.stores,
+        StoreDir::default(),
+        config.trusted_keys,
+        None,
+        config.netrc_file.as_deref(),
+    )?;
+    let here = store_path::system();
+    let roots = (roots.iter())
+        .map(|root| {
+            let (system, path) = root.split_once('=').unwrap_or((&here, root));
+            let path = store_path::parse(caches.store_dir(), path)
+                .with_context(|| format!("parsing {path}"))?;
+            Ok((system.to_owned(), path))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let tmp = tempfile::tempdir()?;
+    println!(
+        "{}",
+        oci::push::push(&caches, &registries, target, &roots, tmp.path()).await?
+    );
+    Ok(())
+}
+
+/// Docker's config file, from `DOCKER_CONFIG` or in `~/.docker`, if there is
+/// one.
+fn docker_config() -> Option<PathBuf> {
+    let dir = (std::env::var_os("DOCKER_CONFIG").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".docker")))?;
+    let file = dir.join("config.json");
+    file.is_file().then_some(file)
 }
 
 /// Binds `address`. An IPv6 address takes IPv4 too, whatever
