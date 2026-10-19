@@ -141,7 +141,9 @@ impl Prefetch {
             return Ok(None);
         };
         let revision = files.get(REVISION).map_or("", |r| r.trim()).to_owned();
-        let Some((name, list)) = store_path::for_system(&files, &self.system) else {
+        let Some((name, list)) =
+            store_path::for_system(&files, store_path::STORE_PATHS, &self.system)
+        else {
             return Ok(Some((revision, Vec::new())));
         };
         let mut roots = (self.store.roots(list.split_whitespace()))
@@ -239,6 +241,9 @@ mod tests {
             // Every closure is over it, and prefetches have no limit.
             max_closure_size: Some(1),
             ensure_free: crate::store::EnsureFree::Bytes(0),
+            closure_registries: Vec::new(),
+            insecure_registries: Vec::new(),
+            registry_credentials: None,
         });
         Prefetch::new(Arc::new(store.unwrap()), dir.to_owned())
     }

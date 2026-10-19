@@ -9,8 +9,8 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::mounts;
-use crate::store::{self, Store};
-use crate::store_path::{self, STORE_PATHS, system};
+use crate::store::{self, Ensured, Store, Wanted};
+use crate::store_path::{self, CLOSURE, STORE_PATHS, system};
 
 pub mod proto {
     #![allow(clippy::all, clippy::pedantic)]
@@ -74,23 +74,19 @@ impl Plugin {
         if !request.readonly {
             return Err(Status::invalid_argument("the volume needs readOnly: true"));
         }
-        let (attribute, store_paths) = store_paths(&request.volume_context, &system())?;
-        let roots = (self.store.roots(store_paths.split_whitespace()))
-            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
-        if roots.is_empty() {
-            return Err(Status::invalid_argument(format!("{attribute} is empty")));
-        }
-        store::root_links(&roots).map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
-
-        let mut ensuring = self.store.ensure(&roots);
+        let wanted = self.wanted(&request.volume_context)?;
+        let mut ensuring = self.store.ensure_wanted(wanted.clone());
         let done = tokio::select! {
-            done = tokio::time::timeout(PUBLISH_WAIT, ensuring.done()) => done,
+            done = tokio::time::timeout(PUBLISH_WAIT, ensuring.closure()) => done,
             () = self.shutdown.cancelled() => {
                 return Err(Status::unavailable("the plugin is shutting down"));
             }
         };
-        let names = match done {
-            Ok(Ok(names)) => names,
+        let Ensured {
+            roots,
+            paths: names,
+        } = match done {
+            Ok(Ok(closure)) => closure,
             Ok(Err(e)) => {
                 warn!(volume = request.volume_id, "{e:#}");
                 let code = if e.is::<store::TooBig>() {
@@ -114,6 +110,11 @@ impl Plugin {
                 return Err(Status::unavailable(msg));
             }
         };
+        // An artifact names its roots only once it's fetched.
+        if let Wanted::Artifact(reference) = &wanted {
+            store::root_links(&roots)
+                .map_err(|e| Status::invalid_argument(format!("{reference}: {e:#}")))?;
+        }
 
         let target = std::path::PathBuf::from(&request.target_path);
         let volume = request.volume_id.clone();
@@ -123,8 +124,24 @@ impl Plugin {
             mounts::publish(&view, &target)
         })
         .await?;
-        info!(volume = request.volume_id, store_paths = ?roots, "published");
+        info!(volume = request.volume_id, closure = %wanted, store_paths = ?roots, "published");
         Ok(NodePublishVolumeResponse {})
+    }
+
+    /// The closure that the volume's attributes ask for.
+    fn wanted(&self, context: &HashMap<String, String>) -> Result<Wanted, Status> {
+        let invalid = |e: anyhow::Error| Status::invalid_argument(format!("{e:#}"));
+        let (attribute, value) = volume_attribute(context, &system())?;
+        if attribute == CLOSURE || attribute.starts_with(&format!("{CLOSURE}.")) {
+            let reference = self.store.artifact(value).map_err(invalid)?;
+            return Ok(Wanted::Artifact(reference));
+        }
+        let roots = (self.store.roots(value.split_whitespace())).map_err(invalid)?;
+        if roots.is_empty() {
+            return Err(Status::invalid_argument(format!("{attribute} is empty")));
+        }
+        store::root_links(&roots).map_err(invalid)?;
+        Ok(Wanted::StorePaths(roots))
     }
 
     async fn unpublish(
@@ -327,15 +344,28 @@ impl Node for Plugin {
     }
 }
 
-fn store_paths<'a>(
+/// The attribute, `storePaths` or `closure` or their variant for `system`,
+/// that names the volume's closure, and its value. A volume has either kind,
+/// not both.
+fn volume_attribute<'a>(
     context: &'a HashMap<String, String>,
     system: &str,
 ) -> Result<(String, &'a str), Status> {
-    store_path::for_system(context, system).ok_or_else(|| {
-        Status::invalid_argument(format!(
-            "no {STORE_PATHS}.{system} or {STORE_PATHS} attribute"
-        ))
-    })
+    let has = |name: &str| {
+        (context.keys())
+            .any(|k| k == name || k.strip_prefix(name).is_some_and(|r| r.starts_with('.')))
+    };
+    let name = match (has(STORE_PATHS), has(CLOSURE)) {
+        (true, true) => {
+            return Err(Status::invalid_argument(format!(
+                "give either {STORE_PATHS} or {CLOSURE} attributes, not both"
+            )));
+        }
+        (false, true) => CLOSURE,
+        _ => STORE_PATHS,
+    };
+    store_path::for_system(context, name, system)
+        .ok_or_else(|| Status::invalid_argument(format!("no {name}.{system} or {name} attribute")))
 }
 
 /// The volume ID names a file in the state dir. An empty target would leave
@@ -363,21 +393,62 @@ mod tests {
             ("storePaths", "/nix/store/a"),
             ("storePaths.aarch64-linux", "/nix/store/b"),
         ]);
-        let (attribute, value) = store_paths(&both, "aarch64-linux").unwrap();
+        let (attribute, value) = volume_attribute(&both, "aarch64-linux").unwrap();
         assert_eq!(
             (attribute.as_str(), value),
             ("storePaths.aarch64-linux", "/nix/store/b")
         );
-        let (attribute, value) = store_paths(&both, "x86_64-linux").unwrap();
+        let (attribute, value) = volume_attribute(&both, "x86_64-linux").unwrap();
         assert_eq!((attribute.as_str(), value), ("storePaths", "/nix/store/a"));
 
         let other = context(&[("storePaths.aarch64-linux", "/nix/store/b")]);
-        let e = store_paths(&other, "x86_64-linux").unwrap_err();
+        let e = volume_attribute(&other, "x86_64-linux").unwrap_err();
         assert_eq!(e.code(), tonic::Code::InvalidArgument);
         assert_eq!(
             e.message(),
             "no storePaths.x86_64-linux or storePaths attribute"
         );
+    }
+
+    #[test]
+    fn picks_a_closure_by_system() {
+        let context = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            (pairs.iter())
+                .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+                .collect()
+        };
+        let both = context(&[
+            ("closure", "oci://r/a@x"),
+            ("closure.aarch64-linux", "oci://r/b@x"),
+            // Kubelet adds attributes of its own.
+            ("csi.storage.k8s.io/ephemeral", "true"),
+        ]);
+        let (attribute, value) = volume_attribute(&both, "aarch64-linux").unwrap();
+        assert_eq!(
+            (attribute.as_str(), value),
+            ("closure.aarch64-linux", "oci://r/b@x")
+        );
+        let (attribute, _) = volume_attribute(&both, "x86_64-linux").unwrap();
+        assert_eq!(attribute, "closure");
+
+        let other = context(&[("closure.aarch64-linux", "oci://r/b@x")]);
+        let e = volume_attribute(&other, "x86_64-linux").unwrap_err();
+        assert_eq!(e.message(), "no closure.x86_64-linux or closure attribute");
+
+        // The kinds don't mix, even across systems.
+        let mixed = context(&[
+            ("closure.aarch64-linux", "oci://r/b@x"),
+            ("storePaths.x86_64-linux", "/nix/store/a"),
+        ]);
+        let e = volume_attribute(&mixed, "aarch64-linux").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "give either storePaths or closure attributes, not both"
+        );
+        // A name that only starts like one counts as neither.
+        let lookalike = context(&[("closures", "x"), ("storePaths", "/nix/store/a")]);
+        assert!(volume_attribute(&lookalike, "aarch64-linux").is_ok());
     }
 
     #[test]

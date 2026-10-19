@@ -3,6 +3,9 @@
 {{- range .Values.extraArgs }}
 {{- if hasPrefix "--trusted-public-keys" . }}{{ $keys = . }}{{ end }}
 {{- end }}
+{{- if not (or .Values.substituters .Values.closureRegistries) }}
+{{- fail "substituters and closureRegistries are both empty, so pods could get no store paths. Add a cache to substituters, or registries to closureRegistries." }}
+{{- end }}
 {{- if not (or $keys (has "--no-require-sigs" .Values.extraArgs)) }}
 {{- fail "trustedPublicKeys is empty, so the plugin would refuse to start. Add a cache's key to trustedPublicKeys, or add --no-require-sigs to extraArgs to accept unsigned narinfos." }}
 {{- end }}
@@ -97,6 +100,9 @@ spec:
             {{- if $.Values.netrcSecret }}
             - --netrc-file=/var/run/secrets/nix-store-csi/netrc
             {{- end }}
+            {{- if $.Values.registryCredentialsSecret }}
+            - --registry-credentials=/var/run/secrets/nix-store-csi/dockerconfig.json
+            {{- end }}
             {{- with $.Values.maxClosureSize }}
             - --max-closure-size={{ . }}
             {{- end }}
@@ -120,6 +126,22 @@ spec:
               value: {{ join " " $.Values.substituters | quote }}
             - name: NIX_STORE_CSI_TRUSTED_PUBLIC_KEYS
               value: {{ join " " $.Values.trustedPublicKeys | quote }}
+            {{- with $.Values.closureRegistries }}
+            - name: NIX_STORE_CSI_CLOSURE_REGISTRIES
+              value: {{ join " " . | quote }}
+            {{- end }}
+            {{- if $.Values.extraCACertificates }}
+            # Setting either one replaces the system's certificates, so both
+            # name the image's bundle and the extra ones.
+            - name: SSL_CERT_FILE
+              value: /etc/ssl/certs/ca-bundle.crt
+            - name: SSL_CERT_DIR
+              value: /etc/nix-store-csi/ca
+            {{- end }}
+            {{- with $.Values.insecureRegistries }}
+            - name: NIX_STORE_CSI_INSECURE_REGISTRIES
+              value: {{ join " " . | quote }}
+            {{- end }}
           {{- with $.Values.s3CredentialsSecret }}
           envFrom:
             - secretRef:
@@ -161,7 +183,7 @@ spec:
               mountPropagation: Bidirectional
             - name: state
               mountPath: /var/lib/nix-store-csi
-            {{- if or $.Values.serviceAccountToken.audience $.Values.netrcSecret }}
+            {{- if or $.Values.serviceAccountToken.audience $.Values.netrcSecret $.Values.registryCredentialsSecret }}
             # A subPath mount wouldn't see kubelet rotate the token or update
             # the Secret, so this mounts the whole directory.
             - name: credentials
@@ -173,6 +195,11 @@ spec:
             # template has no checksum of it that would restart the plugin.
             - name: prefetch
               mountPath: /etc/nix-store-csi/prefetch
+              readOnly: true
+            {{- end }}
+            {{- if $.Values.extraCACertificates }}
+            - name: ca
+              mountPath: /etc/nix-store-csi/ca
               readOnly: true
             {{- end }}
         - name: registrar
@@ -219,7 +246,7 @@ spec:
           hostPath:
             path: {{ $.Values.stateDir }}
             type: DirectoryOrCreate
-        {{- if or $.Values.serviceAccountToken.audience $.Values.netrcSecret }}
+        {{- if or $.Values.serviceAccountToken.audience $.Values.netrcSecret $.Values.registryCredentialsSecret }}
         - name: credentials
           projected:
             sources:
@@ -235,10 +262,22 @@ spec:
                     - key: netrc
                       path: netrc
               {{- end }}
+              {{- with $.Values.registryCredentialsSecret }}
+              - secret:
+                  name: {{ . }}
+                  items:
+                    - key: .dockerconfigjson
+                      path: dockerconfig.json
+              {{- end }}
         {{- end }}
         {{- if $ds.prefetch }}
         - name: prefetch
           configMap:
             name: {{ $ds.configMap }}
+        {{- end }}
+        {{- with $.Values.extraCACertificates }}
+        - name: ca
+          configMap:
+            name: {{ . }}
         {{- end }}
 {{- end }}

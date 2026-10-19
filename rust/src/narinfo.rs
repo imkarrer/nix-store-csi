@@ -40,6 +40,18 @@ impl Compression {
         })
     }
 
+    /// Nix's name, which [`Compression::parse`] reads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
+            Self::Bzip2 => "bzip2",
+            Self::Gzip => "gzip",
+            Self::Brotli => "br",
+        }
+    }
+
     /// Accepts concatenated streams, like Nix.
     pub fn decoder(
         self,
@@ -69,6 +81,9 @@ pub struct NarInfo {
     pub url: String,
     pub compression: Compression,
     parsed: harmonia_store_nar_info::NarInfo,
+    /// The signatures by trusted keys, which [`NarInfo::check_signatures`]
+    /// keeps for `push`, as `<key name>:<base64>`.
+    trusted: Vec<String>,
 }
 
 impl NarInfo {
@@ -89,6 +104,7 @@ impl NarInfo {
             url,
             compression,
             parsed,
+            trusted: Vec::new(),
         })
     }
 
@@ -114,7 +130,13 @@ impl NarInfo {
         &self.parsed.info.info.references
     }
 
-    /// Returns whether one of `keys` signed it, and drops its signatures.
+    /// The signatures that [`NarInfo::check_signatures`] found valid.
+    pub fn trusted_signatures(&self) -> &[String] {
+        &self.trusted
+    }
+
+    /// Returns whether one of `keys` signed it, and drops its signatures. It
+    /// keeps the valid ones apart, out of [`NarInfo::to_text`].
     pub fn check_signatures(&mut self, keys: &[PublicKey]) -> bool {
         let info = &mut self.parsed.info.info;
         let signatures = std::mem::take(&mut info.signatures);
@@ -125,10 +147,14 @@ impl NarInfo {
             info.nar_size,
             &info.references,
         );
-        signatures.iter().any(|sig| {
-            keys.iter()
-                .any(|k| k.name() == sig.name() && k.verify(&fingerprint, sig))
-        })
+        self.trusted = (signatures.iter())
+            .filter(|sig| {
+                keys.iter()
+                    .any(|k| k.name() == sig.name() && k.verify(&fingerprint, sig))
+            })
+            .map(ToString::to_string)
+            .collect();
+        !self.trusted.is_empty()
     }
 }
 
@@ -244,6 +270,38 @@ Sig: test-1:uLy+NsnprYjac4dL2b/QKAqXkcZ2kMJmSWAGrfdHnRb4ycbZsCv7MMXVqp4aPJci0GM6
             .unwrap_or_else(|| panic!("no {pname} in the fixtures"))
     }
 
+    /// A NAR of one regular file.
+    pub fn file_nar(contents: &[u8]) -> Vec<u8> {
+        let mut nar = Vec::new();
+        for s in [
+            &b"nix-archive-1"[..],
+            b"(",
+            b"type",
+            b"regular",
+            b"contents",
+            contents,
+            b")",
+        ] {
+            nar.extend((s.len() as u64).to_le_bytes());
+            nar.extend(s);
+            nar.resize(nar.len().next_multiple_of(8), 0);
+        }
+        nar
+    }
+
+    /// A signature of `info` by `key`, as a narinfo's `Sig` gives it.
+    pub fn sign(info: &NarInfo, key: &harmonia_utils_signature::SecretKey) -> String {
+        let i = &info.parsed.info.info;
+        let fingerprint = fingerprint_path(
+            &i.store_dir,
+            &info.parsed.path,
+            &i.nar_hash,
+            i.nar_size,
+            &i.references,
+        );
+        key.sign(fingerprint).to_string()
+    }
+
     /// A binary cache with no narinfos, in a temporary directory.
     pub fn empty_cache() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -304,7 +362,13 @@ Sig: test-1:uLy+NsnprYjac4dL2b/QKAqXkcZ2kMJmSWAGrfdHnRb4ycbZsCv7MMXVqp4aPJci0GM6
     #[test]
     fn writes_verified_narinfos() {
         let mut info = parse(&format!("{GLIBC}Padding: {}\n", "x".repeat(100))).unwrap();
-        assert!(info.check_signatures(&[key(TEST_KEY), key(NIXOS_KEY)]));
+        assert!(info.check_signatures(&[key(TEST_KEY)]));
+        // Only the signature by the trusted key stays, apart from the text.
+        let test_sig = GLIBC
+            .lines()
+            .find(|l| l.starts_with("Sig: test-1:"))
+            .unwrap();
+        assert_eq!(info.trusted_signatures(), [&test_sig["Sig: ".len()..]]);
         let text = String::from_utf8(info.to_text()).unwrap();
         assert_eq!(text, without_lines(GLIBC, "Sig:"));
     }

@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail, ensure};
@@ -11,7 +12,8 @@ use object_store::signer::{Method, Signer};
 use percent_encoding::percent_decode_str;
 use reqwest::StatusCode;
 use reqwest::header::{
-    CONTENT_RANGE, ETAG, HeaderValue, IF_RANGE, LAST_MODIFIED, RANGE, RETRY_AFTER,
+    ACCEPT, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderValue, IF_RANGE, LAST_MODIFIED, RANGE,
+    RETRY_AFTER, WWW_AUTHENTICATE,
 };
 use tokio::io::{AsyncBufRead, AsyncReadExt, BufReader};
 use tokio::time::Instant;
@@ -19,6 +21,7 @@ use tokio_util::io::StreamReader;
 use url::{Position, Url};
 
 use crate::narinfo::Compression;
+use crate::oci::Credentials;
 
 pub enum Transport {
     File(PathBuf),
@@ -56,6 +59,8 @@ enum Auth {
         token: GcpCredentialProvider,
         objects: Url,
     },
+    /// An OCI registry's credentials and token for one repository.
+    Registry(Arc<Credentials>),
 }
 
 impl Http {
@@ -97,6 +102,7 @@ impl Http {
                 let object = objects.join(url.path().trim_start_matches('/'))?;
                 self.client.get(object).bearer_auth(&token.bearer)
             }
+            Some(Auth::Registry(credentials)) => credentials.authorize(request(), url)?,
         })
     }
 
@@ -239,21 +245,21 @@ fn content_encoding(resp: &reqwest::Response) -> anyhow::Result<Compression> {
 }
 
 /// `body` decoded from `encoding`.
-async fn decode(body: Vec<u8>, encoding: Compression) -> anyhow::Result<Vec<u8>> {
+async fn decode(body: Vec<u8>, encoding: Compression, max: u64) -> anyhow::Result<Vec<u8>> {
     if encoding == Compression::None {
         return Ok(body);
     }
-    // Decoding can make a small body far bigger, so MAX_GET applies again.
+    // Decoding can make a small body far bigger, so `max` applies again.
     let mut data = Vec::new();
     encoding
         .decoder(io::Cursor::new(body))
-        .take(MAX_GET + 1)
+        .take(max + 1)
         .read_to_end(&mut data)
         .await
         .context("decoding the body")?;
     ensure!(
-        data.len() as u64 <= MAX_GET,
-        "body decodes to more than {MAX_GET} bytes"
+        data.len() as u64 <= max,
+        "body decodes to more than {max} bytes"
     );
     Ok(data)
 }
@@ -293,15 +299,31 @@ async fn check_status(mut resp: reqwest::Response) -> Result<reqwest::Response, 
         || s3
             .as_ref()
             .is_some_and(|e| matches!(&*e.code, "SlowDown" | "SlowDownRead"));
+    let challenge = (status == StatusCode::UNAUTHORIZED)
+        .then(|| resp.headers().get(WWW_AUTHENTICATE))
+        .flatten()
+        .and_then(|v| v.to_str().ok());
     Err(Failure {
         error: if is_missing(status, s3.as_ref()) {
             Missing(msg).into()
+        } else if let Some(challenge) = challenge {
+            Unauthorized {
+                msg,
+                challenge: challenge.to_owned(),
+            }
+            .into()
         } else {
             anyhow::anyhow!(msg)
         },
         transient: is_transient(status),
         retry_after: retry_after.or(slow_down.then_some(SLOW_DOWN)),
     })
+}
+
+/// Fails for a status other than 200, with what the server said, like a
+/// request of [`Transport::get`]. A 401 fails with its challenge.
+pub async fn check_response(resp: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+    check_status(resp).await.map_err(|f| f.error)
 }
 
 /// Whether a retry may get another answer than `status`. As in Nix, 501 and
@@ -366,6 +388,38 @@ impl std::fmt::Display for Missing {
 
 impl std::error::Error for Missing {}
 
+/// A 401 with the `WWW-Authenticate` header that says how to authenticate.
+#[derive(Debug)]
+struct Unauthorized {
+    msg: String,
+    challenge: String,
+}
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for Unauthorized {}
+
+/// The `WWW-Authenticate` header of a 401 that `e` reports.
+pub fn challenge(e: &anyhow::Error) -> Option<&str> {
+    (e.chain()).find_map(|e| {
+        e.downcast_ref::<Unauthorized>()
+            .map(|u| u.challenge.as_str())
+    })
+}
+
+/// Whether `e` is a request that couldn't connect, or failed its TLS
+/// handshake.
+pub fn failed_to_connect(e: &anyhow::Error) -> bool {
+    (e.chain()).any(|e| {
+        e.downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_connect)
+    })
+}
+
 /// Whether `e` says the cache hasn't got a file. The cache may still have its
 /// other files.
 pub fn lacks_file(e: &anyhow::Error) -> bool {
@@ -423,7 +477,7 @@ pub fn broke_off(e: &anyhow::Error) -> bool {
     })
 }
 
-fn client() -> anyhow::Result<reqwest::Client> {
+pub fn client() -> anyhow::Result<reqwest::Client> {
     // reqwest loads the system root certificates, so `SSL_CERT_FILE` and
     // `SSL_CERT_DIR` work.
     reqwest::Client::builder()
@@ -487,26 +541,94 @@ impl Transport {
         })
     }
 
+    /// The repository of an OCI registry at `base`, like
+    /// `https://host/v2/<name>/`, read with `credentials`.
+    pub fn registry(base: &Url, credentials: Arc<Credentials>) -> anyhow::Result<Self> {
+        ensure!(
+            matches!(base.scheme(), "http" | "https"),
+            "a registry needs http(s)://"
+        );
+        Ok(Self::Http(Http {
+            base: redact(base),
+            client: client()?,
+            auth: Some(Auth::Registry(credentials)),
+        }))
+    }
+
+    /// A request with the registry's credentials, for pushing to a
+    /// repository from [`Transport::registry`]. `path` is relative to its
+    /// base, or an absolute URL, like an upload's `Location`, on the same
+    /// host.
+    pub fn registry_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> anyhow::Result<(Url, reqwest::RequestBuilder)> {
+        let Self::Http(Http {
+            base,
+            client,
+            auth: Some(Auth::Registry(credentials)),
+        }) = self
+        else {
+            bail!("not a registry");
+        };
+        let url = match Url::parse(path) {
+            Ok(url) => url,
+            // Like `blobs/uploads/`, or a `Location` without the host.
+            Err(url::ParseError::RelativeUrlWithoutBase) => {
+                ensure!(
+                    !path.split(['/', '?']).any(|c| c == ".."),
+                    "bad path for the registry: {path:?}"
+                );
+                base.join(path)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        ensure!(
+            url[..Position::BeforePath] == base[..Position::BeforePath],
+            "the registry sent a URL on another host"
+        );
+        let request = credentials.authorize(client.request(method, url.clone()), &url)?;
+        Ok((url, request))
+    }
+
     /// A small file like a narinfo, or `None` if the cache hasn't got it.
     pub async fn get(&self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        match self.get_with(path, true).await {
+        match self.get_with(path, true, None, MAX_GET).await {
             Err(e) if lacks_file(&e) => Ok(None),
-            result => result.map(Some),
+            result => result.map(|(body, _)| Some(body)),
         }
     }
 
     /// Like [`Transport::get`], without retrying. A missing file is an error
     /// that [`lacks_file`] matches, and it keeps what the cache said.
     pub async fn get_once(&self, path: &str) -> anyhow::Result<Vec<u8>> {
-        self.get_with(path, false).await
+        Ok(self.get_with(path, false, None, MAX_GET).await?.0)
     }
 
-    async fn get_with(&self, path: &str, retries: bool) -> anyhow::Result<Vec<u8>> {
+    /// Like [`Transport::get`], with an `Accept` header and a limit of `max`
+    /// bytes. Also returns the `Content-Type`. A missing file is an error.
+    pub async fn get_typed(
+        &self,
+        path: &str,
+        accept: &str,
+        max: u64,
+    ) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+        self.get_with(path, true, Some(accept), max).await
+    }
+
+    async fn get_with(
+        &self,
+        path: &str,
+        retries: bool,
+        accept: Option<&str>,
+        max: u64,
+    ) -> anyhow::Result<(Vec<u8>, Option<String>)> {
         match self {
             Self::File(base) => {
                 let file = file_path(base, path)?;
                 match tokio::fs::read(&file).await {
-                    Ok(data) => Ok(data),
+                    Ok(data) => Ok((data, None)),
                     // A missing cache directory is an error, not a missing file.
                     Err(e) if e.kind() == io::ErrorKind::NotFound && base.is_dir() => {
                         Err(Missing(format!("no {}", file.display())).into())
@@ -517,19 +639,23 @@ impl Transport {
             Self::Http(http) => {
                 let url = request_url(&http.base, path)?;
                 retry(&url, retries, || async {
-                    let resp = http.request(&url).await?.send().await?;
-                    let mut resp = check_status(resp).await?;
+                    let mut request = http.request(&url).await?;
+                    if let Some(accept) = accept {
+                        request = request.header(ACCEPT, accept);
+                    }
+                    let mut resp = check_status(request.send().await?).await?;
                     let encoding = content_encoding(&resp)?;
+                    let content_type = (resp.headers().get(CONTENT_TYPE))
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
                     let mut body = Vec::new();
                     while let Some(chunk) = resp.chunk().await? {
-                        if (body.len() + chunk.len()) as u64 > MAX_GET {
-                            return Err(
-                                anyhow::anyhow!("body is larger than {MAX_GET} bytes").into()
-                            );
+                        if (body.len() + chunk.len()) as u64 > max {
+                            return Err(anyhow::anyhow!("body is larger than {max} bytes").into());
                         }
                         body.extend_from_slice(&chunk);
                     }
-                    Ok(decode(body, encoding).await?)
+                    Ok((decode(body, encoding, max).await?, content_type))
                 })
                 .await
             }

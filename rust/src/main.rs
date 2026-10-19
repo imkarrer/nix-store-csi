@@ -13,17 +13,21 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_stream::wrappers::UnixListenerStream;
 use tracing::{error, info, warn};
 
+use crate::closure::Caches;
 use crate::csi::Plugin;
 use crate::csi::proto::identity_server::IdentityServer;
 use crate::csi::proto::node_server::NodeServer;
 use crate::narinfo::PublicKey;
-use crate::store::{Config, EnsureFree, Excess, Store};
+use crate::oci::Registries;
+use crate::store::{Config, EnsureFree, Excess, Narinfos, Store, Wanted};
+use harmonia_store_path::StoreDir;
 
 mod closure;
 mod csi;
 mod metrics;
 mod mounts;
 mod narinfo;
+mod oci;
 mod prefetch;
 mod store;
 mod store_path;
@@ -71,6 +75,42 @@ struct Cli {
         global = true
     )]
     netrc_file: Option<PathBuf>,
+
+    /// OCI registry hosts, like `registry.local` or `registry.local:5000`, to
+    /// reach over plain HTTP instead of HTTPS.
+    #[arg(
+        long,
+        value_name = "HOSTS",
+        env = "NIX_STORE_CSI_INSECURE_REGISTRIES",
+        default_value = "",
+        hide_default_value = true,
+        global = true
+    )]
+    insecure_registries: String,
+
+    /// Registries that `closure` volumes may name, as `host[:port]`, or
+    /// `host[:port]/<prefix>` for the repositories under a prefix. Empty turns
+    /// `closure` volumes off.
+    #[arg(
+        long,
+        value_name = "LIST",
+        env = "NIX_STORE_CSI_CLOSURE_REGISTRIES",
+        default_value = "",
+        hide_default_value = true,
+        global = true
+    )]
+    closure_registries: String,
+
+    /// Docker config file with logins for registries, like the
+    /// `.dockerconfigjson` of an image pull Secret, read on every request.
+    /// `push` defaults to Docker's own.
+    #[arg(
+        long,
+        value_name = "FILE",
+        env = "NIX_STORE_CSI_REGISTRY_CREDENTIALS",
+        global = true
+    )]
+    registry_credentials: Option<PathBuf>,
 
     /// Directory that holds the node store in `store/`.
     #[arg(
@@ -185,7 +225,19 @@ enum Command {
     /// Fetch the closures of store paths into the node store and print its
     /// directory, for use with `podman -v DIR:/nix/store:ro`.
     Unpack {
-        /// Store paths, their base names, or paths inside them.
+        /// Store paths, their base names, or paths inside them. Or one
+        /// `oci://<host>/<name>@sha256:<digest>` artifact.
+        #[arg(value_name = "STORE_PATH", required = true)]
+        roots: Vec<String>,
+    },
+    /// Push the closures of store paths from the caches to a registry, as an
+    /// artifact for `closure` volumes, and print the reference that pins it.
+    Push {
+        /// `oci://<host>/<name>`, with an optional `:<tag>`.
+        #[arg(value_name = "TARGET")]
+        target: String,
+        /// Store paths for this machine's system, or `<system>=<store path>`
+        /// for others. Several systems get an index.
         #[arg(value_name = "STORE_PATH", required = true)]
         roots: Vec<String>,
     },
@@ -223,11 +275,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if trusted_keys.is_empty() && !cli.no_require_sigs {
         bail!("no trusted public keys given; pass --no-require-sigs to accept unsigned narinfos");
     }
-    let stores: Vec<_> = (cli.substituters.split_whitespace())
-        .map(str::to_owned)
-        .collect();
-    if stores.is_empty() {
+    let list = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+    let stores = list(&cli.substituters);
+    let closure_registries = list(&cli.closure_registries);
+    // A node that only mounts `closure` volumes needs no cache.
+    if stores.is_empty()
+        && (closure_registries.is_empty() || matches!(cli.command, Command::Push { .. }))
+    {
         bail!("no substituters given");
+    }
+    let trusted_keys = (!cli.no_require_sigs).then_some(trusted_keys);
+    if let Command::Push { target, roots } = &cli.command {
+        return push(&cli, target, roots, &stores, trusted_keys).await;
     }
     let (max_closure_size, ensure_free) = match cli.command {
         Command::Csi {
@@ -236,21 +295,31 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             ..
         } => (max_closure_size, ensure_free),
         Command::Unpack { .. } => (None, EnsureFree::Bytes(0)),
+        Command::Push { .. } => unreachable!("pushed above"),
     };
     let store = Arc::new(Store::new(Config {
         stores,
-        trusted_keys: (!cli.no_require_sigs).then_some(trusted_keys),
+        trusted_keys,
         state_dir: cli.state_dir,
         jobs: cli.max_substitution_jobs.get(),
         netrc_file: cli.netrc_file,
         max_closure_size,
         ensure_free,
+        closure_registries,
+        insecure_registries: list(&cli.insecure_registries),
+        registry_credentials: cli.registry_credentials,
     })?);
 
     match cli.command {
+        Command::Push { .. } => unreachable!("pushed above"),
         Command::Unpack { roots } => {
-            let roots = store.roots(roots.iter().map(String::as_str))?;
-            store.ensure(&roots).done().await?;
+            let mut ensuring = match roots.as_slice() {
+                [one] if one.starts_with("oci://") => {
+                    store.ensure_wanted(Wanted::Artifact(store.artifact(one)?))
+                }
+                _ => store.ensure(&store.roots(roots.iter().map(String::as_str))?),
+            };
+            ensuring.done().await?;
             store.sync_all().await?;
             println!("{}", store.dir().display());
             Ok(())
@@ -281,6 +350,53 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             serve(&endpoint, plugin).await
         }
     }
+}
+
+/// Pushes the closures of `roots` to `target` and prints the reference.
+async fn push(
+    cli: &Cli,
+    target: &str,
+    roots: &[String],
+    stores: &[String],
+    trusted_keys: Option<Vec<PublicKey>>,
+) -> anyhow::Result<()> {
+    let credentials = cli.registry_credentials.clone().or_else(docker_config);
+    let insecure = cli
+        .insecure_registries
+        .split_whitespace()
+        .map(str::to_owned);
+    let registries = Registries::new(Vec::new(), insecure.collect(), credentials);
+    let tmp = tempfile::tempdir()?;
+    let caches = Caches::new(
+        stores,
+        StoreDir::default(),
+        trusted_keys,
+        Narinfos::new(tmp.path().join("narinfo")),
+        cli.netrc_file.as_deref(),
+    )?;
+    let here = store_path::system();
+    let roots = (roots.iter())
+        .map(|root| {
+            let (system, path) = root.split_once('=').unwrap_or((&here, root));
+            let path = store_path::parse(caches.store_dir(), path)
+                .with_context(|| format!("parsing {path}"))?;
+            Ok((system.to_owned(), path))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    println!(
+        "{}",
+        oci::push::push(&caches, &registries, target, &roots, tmp.path()).await?
+    );
+    Ok(())
+}
+
+/// Docker's config file, from `DOCKER_CONFIG` or in `~/.docker`, if there is
+/// one.
+fn docker_config() -> Option<PathBuf> {
+    let dir = (std::env::var_os("DOCKER_CONFIG").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".docker")))?;
+    let file = dir.join("config.json");
+    file.is_file().then_some(file)
 }
 
 /// Binds `address`. An IPv6 address takes IPv4 too, whatever
