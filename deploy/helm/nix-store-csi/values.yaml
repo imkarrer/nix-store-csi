@@ -32,6 +32,14 @@ substituters:
 # The plugin accepts only narinfos signed by one of these keys.
 trustedPublicKeys:
   - cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+# Registries that `closure` volumes may name, as host[:port], or
+# host[:port]/<prefix> for the repositories under a prefix. Empty turns
+# `closure` volumes off. With registries here, substituters may be empty.
+#   - registry.example.com/nix-closures
+closureRegistries: []
+# OCI registry hosts, like registry.local or registry.local:5000, that `closure`
+# volumes read over plain HTTP instead of HTTPS.
+insecureRegistries: []
 # A Secret whose netrc key holds the caches' credentials in netrc format:
 #   machine cache.example.com login user password secret
 netrcSecret: ""

@@ -3,6 +3,9 @@
 {{- range .Values.extraArgs }}
 {{- if hasPrefix "--trusted-public-keys" . }}{{ $keys = . }}{{ end }}
 {{- end }}
+{{- if not (or .Values.substituters .Values.closureRegistries) }}
+{{- fail "substituters and closureRegistries are both empty, so pods could get no store paths. Add a cache to substituters, or registries to closureRegistries." }}
+{{- end }}
 {{- if not (or $keys (has "--no-require-sigs" .Values.extraArgs)) }}
 {{- fail "trustedPublicKeys is empty, so the plugin would refuse to start. Add a cache's key to trustedPublicKeys, or add --no-require-sigs to extraArgs to accept unsigned narinfos." }}
 {{- end }}
@@ -120,6 +123,14 @@ spec:
               value: {{ join " " $.Values.substituters | quote }}
             - name: NIX_STORE_CSI_TRUSTED_PUBLIC_KEYS
               value: {{ join " " $.Values.trustedPublicKeys | quote }}
+            {{- with $.Values.closureRegistries }}
+            - name: NIX_STORE_CSI_CLOSURE_REGISTRIES
+              value: {{ join " " . | quote }}
+            {{- end }}
+            {{- with $.Values.insecureRegistries }}
+            - name: NIX_STORE_CSI_INSECURE_REGISTRIES
+              value: {{ join " " . | quote }}
+            {{- end }}
           {{- with $.Values.s3CredentialsSecret }}
           envFrom:
             - secretRef:
