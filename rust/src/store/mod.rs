@@ -31,9 +31,10 @@ use self::sandbox::Sandbox;
 use crate::closure::Caches;
 use crate::metrics::Metrics;
 use crate::narinfo::PublicKey;
+use crate::oci::{self, Registries};
 use crate::store_path;
 
-pub use self::fetch::{Ensuring, TooBig};
+pub use self::fetch::{Ensured, Ensuring, TooBig, Wanted};
 pub use self::gc::{EnsureFree, Excess, parse_ensure_free, parse_size};
 pub use self::narinfos::Narinfos;
 pub use self::views::{Usage, check_volume, root_links};
@@ -57,10 +58,15 @@ pub struct Config {
     pub max_closure_size: Option<u64>,
     /// The free space that collection keeps.
     pub ensure_free: EnsureFree,
+    /// `host[:port][/<repository prefix>]` that `closure` volumes may name.
+    pub closure_registries: Vec<String>,
+    /// Registry hosts that `closure` volumes read over plain HTTP.
+    pub insecure_registries: Vec<String>,
 }
 
 pub struct Store {
     caches: Caches,
+    registries: Registries,
     narinfos: Narinfos,
     dir: PathBuf,
     views: PathBuf,
@@ -182,6 +188,7 @@ impl Store {
                 narinfos.clone(),
                 config.netrc_file.as_deref(),
             )?,
+            registries: Registries::new(config.closure_registries, config.insecure_registries),
             narinfos,
             dir,
             views,
@@ -224,6 +231,11 @@ impl Store {
 
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// Parses a `closure` volume attribute.
+    pub fn artifact(&self, reference: &str) -> anyhow::Result<oci::Reference> {
+        self.registries.parse(reference)
     }
 
     pub fn gauges(&self) -> Gauges {
@@ -641,6 +653,8 @@ mod tests {
             netrc_file: None,
             max_closure_size: None,
             ensure_free: EnsureFree::Bytes(0),
+            closure_registries: Vec::new(),
+            insecure_registries: Vec::new(),
         };
         let new = tmp.path().join("new");
         drop(Store::new(config(&new)).unwrap());

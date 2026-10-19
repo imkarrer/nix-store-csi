@@ -15,6 +15,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::narinfo::{NarInfo, PublicKey};
+use crate::oci::{Artifact, Repository};
 use crate::store::Narinfos;
 use crate::transport::{self, Transport};
 
@@ -50,9 +51,16 @@ struct Cache {
     failed: Mutex<Option<(Instant, String)>>,
 }
 
+/// The narinfo of each store path in a closure.
+pub type Closure = BTreeMap<StorePath, Arc<Entry>>;
+
 pub struct Entry {
-    /// Index of the cache in the order given, or `None` for the node store.
+    /// Index of the cache in the order given, or `None` for the node store or
+    /// a registry.
     pub cache: Option<usize>,
+    /// The repository of the artifact that listed the path, if any. Its NAR
+    /// comes from there.
+    pub registry: Option<Arc<Repository>>,
     pub info: NarInfo,
 }
 
@@ -158,10 +166,7 @@ impl Caches {
     /// Resolves the closure of `roots`. Each narinfo comes from the node
     /// store, or else from the first cache that has it with a trusted
     /// signature.
-    pub async fn resolve(
-        &self,
-        roots: &[StorePath],
-    ) -> anyhow::Result<BTreeMap<StorePath, Arc<Entry>>> {
+    pub async fn resolve(&self, roots: &[StorePath]) -> anyhow::Result<Closure> {
         let tiers = OnceCell::new();
         let mut found = BTreeMap::new();
         let mut seen = BTreeSet::new();
@@ -235,7 +240,9 @@ impl Caches {
 
     /// Finds another cache for `entry` after its NAR fails. It looks only in
     /// the caches not `tried` yet. The closure came from `entry`'s references,
-    /// so it accepts only a narinfo with the same references.
+    /// so it accepts only a narinfo with the same references. An artifact pins
+    /// its NARs by digest, so for a path from a registry it also needs the same
+    /// `NarHash`.
     pub async fn next(&self, entry: &Entry, tried: &[usize]) -> anyhow::Result<Option<Arc<Entry>>> {
         let mut tiers = self.tiers().await;
         for tier in &mut tiers {
@@ -243,8 +250,48 @@ impl Caches {
         }
         self.lookup(entry.info.path(), &tiers, |info| {
             info.references() == entry.info.references()
+                && (entry.registry.is_none() || info.nar_hash() == entry.info.nar_hash())
         })
         .await
+    }
+
+    /// The roots and closure that `artifact` lists. Each path needs a trusted
+    /// signature, as from a cache. A pod picks the registry, unlike the
+    /// caches, and the node store serves what it fetches to every pod, so
+    /// without trusted keys this refuses every artifact.
+    pub fn resolve_artifact(
+        &self,
+        artifact: Artifact,
+    ) -> anyhow::Result<(Vec<StorePath>, Closure)> {
+        let name = &artifact.repository.name;
+        ensure!(
+            self.trusted_keys.is_some(),
+            "{name}: closure volumes need trusted public keys, since a pod picks the \
+             registry and the node store is shared"
+        );
+        let mut untrusted = Vec::new();
+        let mut found = BTreeMap::new();
+        for mut info in artifact.layers {
+            if !self.trust(&mut info) {
+                untrusted.push(self.store_dir.display(info.path()).to_string());
+                continue;
+            }
+            let entry = Entry {
+                cache: None,
+                registry: Some(artifact.repository.clone()),
+                info,
+            };
+            found.insert(entry.info.path().clone(), Arc::new(entry));
+        }
+        if !untrusted.is_empty() {
+            untrusted.sort();
+            bail!(
+                "{name} has no trusted signature for:\n  {}",
+                untrusted.join("\n  ")
+            );
+        }
+        tracing::debug!("{name} lists {} store paths", found.len());
+        Ok((artifact.roots, found))
     }
 
     async fn find(
@@ -253,7 +300,13 @@ impl Caches {
         tiers: &OnceCell<Vec<Vec<usize>>>,
     ) -> anyhow::Result<Option<Arc<Entry>>> {
         match self.local_info(path) {
-            Ok(Some(info)) => return Ok(Some(Arc::new(Entry { cache: None, info }))),
+            Ok(Some(info)) => {
+                return Ok(Some(Arc::new(Entry {
+                    cache: None,
+                    registry: None,
+                    info,
+                })));
+            }
             Ok(None) => {}
             Err(e) => tracing::warn!("{e:#}"),
         }
@@ -337,6 +390,7 @@ impl Caches {
                         tracing::trace!("found {path} in {name}");
                         return Ok(Some(Arc::new(Entry {
                             cache: Some(cache),
+                            registry: None,
                             info,
                         })));
                     }

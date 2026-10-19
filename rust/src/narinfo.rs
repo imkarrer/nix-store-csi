@@ -40,6 +40,18 @@ impl Compression {
         })
     }
 
+    /// Nix's name, which [`Compression::parse`] reads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
+            Self::Bzip2 => "bzip2",
+            Self::Gzip => "gzip",
+            Self::Brotli => "br",
+        }
+    }
+
     /// Accepts concatenated streams, like Nix.
     pub fn decoder(
         self,
@@ -242,6 +254,38 @@ Sig: test-1:uLy+NsnprYjac4dL2b/QKAqXkcZ2kMJmSWAGrfdHnRb4ycbZsCv7MMXVqp4aPJci0GM6
             .map(|(_, _, info)| info.path().clone())
             .find(|path| path.name().to_string().starts_with(&format!("{pname}-")))
             .unwrap_or_else(|| panic!("no {pname} in the fixtures"))
+    }
+
+    /// A NAR of one regular file.
+    pub fn file_nar(contents: &[u8]) -> Vec<u8> {
+        let mut nar = Vec::new();
+        for s in [
+            &b"nix-archive-1"[..],
+            b"(",
+            b"type",
+            b"regular",
+            b"contents",
+            contents,
+            b")",
+        ] {
+            nar.extend((s.len() as u64).to_le_bytes());
+            nar.extend(s);
+            nar.resize(nar.len().next_multiple_of(8), 0);
+        }
+        nar
+    }
+
+    /// A signature of `info` by `key`, as a narinfo's `Sig` gives it.
+    pub fn sign(info: &NarInfo, key: &harmonia_utils_signature::SecretKey) -> String {
+        let i = &info.parsed.info.info;
+        let fingerprint = fingerprint_path(
+            &i.store_dir,
+            &info.parsed.path,
+            &i.nar_hash,
+            i.nar_size,
+            &i.references,
+        );
+        key.sign(fingerprint).to_string()
     }
 
     /// A binary cache with no narinfos, in a temporary directory.

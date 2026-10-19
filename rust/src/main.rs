@@ -17,13 +17,14 @@ use crate::csi::Plugin;
 use crate::csi::proto::identity_server::IdentityServer;
 use crate::csi::proto::node_server::NodeServer;
 use crate::narinfo::PublicKey;
-use crate::store::{Config, EnsureFree, Excess, Store};
+use crate::store::{Config, EnsureFree, Excess, Store, Wanted};
 
 mod closure;
 mod csi;
 mod metrics;
 mod mounts;
 mod narinfo;
+mod oci;
 mod prefetch;
 mod store;
 mod store_path;
@@ -71,6 +72,31 @@ struct Cli {
         global = true
     )]
     netrc_file: Option<PathBuf>,
+
+    /// OCI registry hosts, like `registry.local` or `registry.local:5000`, to
+    /// reach over plain HTTP instead of HTTPS.
+    #[arg(
+        long,
+        value_name = "HOSTS",
+        env = "NIX_STORE_CSI_INSECURE_REGISTRIES",
+        default_value = "",
+        hide_default_value = true,
+        global = true
+    )]
+    insecure_registries: String,
+
+    /// Registries that `closure` volumes may name, as `host[:port]`, or
+    /// `host[:port]/<prefix>` for the repositories under a prefix. Empty turns
+    /// `closure` volumes off.
+    #[arg(
+        long,
+        value_name = "LIST",
+        env = "NIX_STORE_CSI_CLOSURE_REGISTRIES",
+        default_value = "",
+        hide_default_value = true,
+        global = true
+    )]
+    closure_registries: String,
 
     /// Directory that holds the node store in `store/`.
     #[arg(
@@ -185,7 +211,8 @@ enum Command {
     /// Fetch the closures of store paths into the node store and print its
     /// directory, for use with `podman -v DIR:/nix/store:ro`.
     Unpack {
-        /// Store paths, their base names, or paths inside them.
+        /// Store paths, their base names, or paths inside them. Or one
+        /// `oci://<host>/<name>@sha256:<digest>` artifact.
         #[arg(value_name = "STORE_PATH", required = true)]
         roots: Vec<String>,
     },
@@ -223,12 +250,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if trusted_keys.is_empty() && !cli.no_require_sigs {
         bail!("no trusted public keys given; pass --no-require-sigs to accept unsigned narinfos");
     }
-    let stores: Vec<_> = (cli.substituters.split_whitespace())
-        .map(str::to_owned)
-        .collect();
-    if stores.is_empty() {
+    let list = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+    let stores = list(&cli.substituters);
+    let closure_registries = list(&cli.closure_registries);
+    // A node that only mounts `closure` volumes needs no cache.
+    if stores.is_empty() && closure_registries.is_empty() {
         bail!("no substituters given");
     }
+    let trusted_keys = (!cli.no_require_sigs).then_some(trusted_keys);
     let (max_closure_size, ensure_free) = match cli.command {
         Command::Csi {
             max_closure_size,
@@ -239,18 +268,25 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     let store = Arc::new(Store::new(Config {
         stores,
-        trusted_keys: (!cli.no_require_sigs).then_some(trusted_keys),
+        trusted_keys,
         state_dir: cli.state_dir,
         jobs: cli.max_substitution_jobs.get(),
         netrc_file: cli.netrc_file,
         max_closure_size,
         ensure_free,
+        closure_registries,
+        insecure_registries: list(&cli.insecure_registries),
     })?);
 
     match cli.command {
         Command::Unpack { roots } => {
-            let roots = store.roots(roots.iter().map(String::as_str))?;
-            store.ensure(&roots).done().await?;
+            let mut ensuring = match roots.as_slice() {
+                [one] if one.starts_with("oci://") => {
+                    store.ensure_wanted(Wanted::Artifact(store.artifact(one)?))
+                }
+                _ => store.ensure(&store.roots(roots.iter().map(String::as_str))?),
+            };
+            ensuring.done().await?;
             store.sync_all().await?;
             println!("{}", store.dir().display());
             Ok(())

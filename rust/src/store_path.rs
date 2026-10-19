@@ -4,11 +4,17 @@ use harmonia_store_path::{StoreDir, StorePath};
 
 /// The volume attribute that lists space-separated store paths, or paths
 /// inside them. On a node of Nix system `<system>`, `storePaths.<system>`
-/// replaces it, so one manifest can serve multiple systems. These are the
-/// only volume attributes because pods on a node share the node store. A pod
-/// that could pick a cache or key could put its own content under any store
-/// path for every pod. The files in `--prefetch-dir` have the same names.
+/// replaces it, so one manifest can serve multiple systems. Pods on a node
+/// share the node store, so a pod can't pick a cache or key. Otherwise it
+/// could put its own content under any store path for every pod. The files in
+/// `--prefetch-dir` have the same names.
 pub const STORE_PATHS: &str = "storePaths";
+
+/// The volume attribute that pins an OCI artifact listing a closure, in place
+/// of `storePaths`, with `closure.<system>` for each system like
+/// `storePaths.<system>`. The pod picks the registry, so each store path still
+/// needs a signature by a trusted key.
+pub const CLOSURE: &str = "closure";
 
 /// The Nix system of this node. Rust and Nix use the same names for `x86_64`
 /// and `aarch64`, the architectures the plugin is built for.
