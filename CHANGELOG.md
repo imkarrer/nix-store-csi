@@ -19,9 +19,11 @@
 ### Added
 
 - The `closure` volume attribute, and `closure.<system>`, in place of
-  `storePaths`. It names, by digest, an OCI manifest that has a layer for
-  each store path's NAR, and the plugin fetches the closure from the
-  registry. Each path still needs a trusted signature.
+  `storePaths`. It names, by digest, an OCI index or manifest that has a
+  layer for each store path's NAR, and the plugin fetches the closure from
+  the registry. An index has a manifest for each system, and the plugin
+  takes the one for its node. A registry that asks for a token gets an
+  anonymous one. Each path still needs a trusted signature.
   [OCI.md](docs/OCI.md) describes the format.
 - `--closure-registries` and the chart's `closureRegistries` list the
   registries that `closure` volumes may name. It is empty by default, which

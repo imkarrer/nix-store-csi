@@ -147,7 +147,8 @@ insecureRegistries:
   - registry.registry.svc
 ```
 
-- The plugin reads repositories that need no login.
+- The plugin reads repositories that need no login, and those that ask for
+  an anonymous token, like public repositories on ghcr.io.
 - The paths in an artifact need signatures by `trustedPublicKeys`, as from a
   cache, so with `--no-require-sigs` the plugin refuses `closure` volumes.
 - With `closureRegistries`, `substituters` may be empty. The nodes then need

@@ -21,6 +21,9 @@ can read it:
 - **One reference for a closure.** The pod spec names the registry and the
   digest. The plugin resolves the closure with one manifest request, instead
   of a narinfo request for each path.
+- **One reference for every system.** An index has a manifest for each
+  system, so one `closure` attribute replaces a `storePaths.<system>` for
+  each, and the `.roots/` links keep `args` the same on every system.
 - **Copies keep the digest.** `crane copy` copies the artifact to another
   registry with the same digest, so a cluster can run from its own registry,
   with `substituters` empty and no binary cache in reach.
@@ -54,7 +57,15 @@ tells tools like Renovate which tag to follow, and the plugin ignores it.
 
 ## Format
 
-The digest names a **manifest** (`application/vnd.oci.image.manifest.v1+json`) has
+The digest names either an image index or a manifest.
+
+An **index** (`application/vnd.oci.image.index.v1+json`) has a manifest for
+each system. The plugin takes the entry whose `platform` is `os: linux` and
+the node's `architecture`, `amd64` for `x86_64-linux` and `arm64` for
+`aarch64-linux`. An entry may set `artifactType`, which then has to be
+`application/vnd.nix-store-csi.closure.v1`.
+
+A **manifest** (`application/vnd.oci.image.manifest.v1+json`) has
 `artifactType: application/vnd.nix-store-csi.closure.v1`, a config, and a
 layer for each store path in the closure.
 
@@ -107,8 +118,9 @@ compressed file.
 
 The registry is a transport the plugin doesn't trust, like a cache:
 
-1. The manifest has the digest that the volume pins, and the config has the
-   digest in the manifest.
+1. The manifest or index has the digest that the volume pins, a manifest
+   from an index has the digest in its entry, and the config has the digest
+   in the manifest.
 2. The layers hold the roots and every reference, each path once.
 3. A key in `trustedPublicKeys` signed each path. The signature covers the
    store path, `NarHash`, `NarSize` and references, so the same signatures
@@ -127,4 +139,8 @@ name. Plain HTTP needs the host in `insecureRegistries` too. If a NAR from a
 registry fails, the plugin looks for the path in `substituters`, and takes it
 only from a narinfo with the same `NarHash`.
 
-The plugin reads repositories that need no login.
+## Logins
+
+The plugin reads repositories that need no login. It answers a
+`WWW-Authenticate: Bearer` challenge with an anonymous token from the
+registry's token service, as public repositories on ghcr.io need.

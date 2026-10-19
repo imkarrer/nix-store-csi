@@ -114,8 +114,9 @@ volumeAttributes:
 
 - The reference needs the digest. The tag before it is optional, and only
   tells tools like Renovate which tag to follow.
-- A manifest holds one system's closure. `closure.<system>` names one for
-  each system, like `storePaths.<system>`.
+- With several systems the reference names an index, and each node takes the
+  manifest for its system, so one attribute serves every architecture.
+  `closure.<system>` works like `storePaths.<system>`.
 - A volume has either `storePaths` or `closure` attributes, not both.
 - The NARs come from the registry, and each store path still needs a
   signature by a key in `trustedPublicKeys`.
