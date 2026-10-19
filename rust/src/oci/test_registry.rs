@@ -1,5 +1,6 @@
 //! A registry for the tests, with just enough of the OCI distribution API to
-//! pull: manifests and blobs by digest or tag.
+//! pull: manifests and blobs by digest or tag, and anonymous tokens from its
+//! token service.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -12,6 +13,17 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+
+const TOKEN: &str = "granted-token";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Login {
+    /// Anyone may pull.
+    None,
+    /// Every request needs a token from the token service, which gives anyone
+    /// one, as for public repositories on ghcr.io.
+    Token,
+}
 
 /// Content by path, with its content type.
 pub type Files = HashMap<String, (String, Vec<u8>)>;
@@ -28,7 +40,7 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub async fn start() -> Self {
+    pub async fn start(login: Login) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let registry = Self {
             host: listener.local_addr().unwrap().to_string(),
@@ -42,7 +54,7 @@ impl Registry {
                 let this = this.clone();
                 let service = service_fn(move |request| {
                     let this = this.clone();
-                    async move { Ok::<_, Infallible>(this.respond(&request)) }
+                    async move { Ok::<_, Infallible>(this.respond(&request, login)) }
                 });
                 tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(stream), service));
             }
@@ -64,15 +76,50 @@ impl Registry {
         self.files.lock().unwrap().get(path).map(|(_, b)| b.clone())
     }
 
-    fn respond(&self, request: &Request<Incoming>) -> Response<Full<Bytes>> {
+    /// What to answer a request with `authorization` if it may not go on.
+    fn challenge(&self, login: Login, authorization: &str) -> Option<String> {
+        match login {
+            Login::None => None,
+            Login::Token if authorization == format!("Bearer {TOKEN}") => None,
+            Login::Token => Some(format!(
+                r#"Bearer realm="http://{}/token",service="test""#,
+                self.host
+            )),
+        }
+    }
+
+    fn respond(&self, request: &Request<Incoming>, login: Login) -> Response<Full<Bytes>> {
         let path = request.uri().path().to_owned();
+        let query = request.uri().query().unwrap_or_default().to_owned();
         let method = request.method().clone();
         (self.log.lock().unwrap()).push(format!("{method} {path}"));
+        let authorization = (request.headers().get(header::AUTHORIZATION))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
         let reply = |status: StatusCode, body: Vec<u8>| {
             let mut response = Response::new(Full::new(Bytes::from(body)));
             *response.status_mut() = status;
             response
         };
+        if path == "/token" {
+            if login != Login::Token {
+                return reply(StatusCode::UNAUTHORIZED, Vec::new());
+            }
+            assert!(query.contains("scope=repository%3A"), "{query}");
+            return reply(
+                StatusCode::OK,
+                format!(r#"{{"token":"{TOKEN}"}}"#).into_bytes(),
+            );
+        }
+        let challenge = self.challenge(login, &authorization);
+        if let Some(challenge) = challenge {
+            let mut response = reply(StatusCode::UNAUTHORIZED, b"{\"errors\":[]}".to_vec());
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, challenge.parse().unwrap());
+            return response;
+        }
         match method {
             Method::GET | Method::HEAD => match self.files.lock().unwrap().get(&path) {
                 Some((content_type, content)) => {

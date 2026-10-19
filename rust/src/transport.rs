@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail, ensure};
@@ -13,7 +14,7 @@ use percent_encoding::percent_decode_str;
 use reqwest::StatusCode;
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderValue,
-    IF_RANGE, LAST_MODIFIED, RANGE, RETRY_AFTER,
+    IF_RANGE, LAST_MODIFIED, RANGE, RETRY_AFTER, WWW_AUTHENTICATE,
 };
 use tokio::io::{AsyncBufRead, AsyncReadExt, BufReader};
 use tokio::time::Instant;
@@ -22,6 +23,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use url::{Position, Url};
 
 use crate::narinfo::Compression;
+use crate::oci::Credentials;
 
 pub enum Transport {
     File(PathBuf),
@@ -59,6 +61,8 @@ enum Auth {
         token: GcpCredentialProvider,
         objects: Url,
     },
+    /// An OCI registry's credentials and token for one repository.
+    Registry(Arc<Credentials>),
 }
 
 impl Http {
@@ -100,6 +104,7 @@ impl Http {
                 let object = objects.join(url.path().trim_start_matches('/'))?;
                 self.client.get(object).bearer_auth(&token.bearer)
             }
+            Some(Auth::Registry(credentials)) => credentials.authorize(request(), url),
         })
     }
 
@@ -318,9 +323,19 @@ async fn check_status(mut resp: reqwest::Response) -> Result<reqwest::Response, 
         || s3
             .as_ref()
             .is_some_and(|e| matches!(&*e.code, "SlowDown" | "SlowDownRead"));
+    let challenge = (status == StatusCode::UNAUTHORIZED)
+        .then(|| resp.headers().get(WWW_AUTHENTICATE))
+        .flatten()
+        .and_then(|v| v.to_str().ok());
     Err(Failure {
         error: if is_missing(status, s3.as_ref()) {
             Missing(msg).into()
+        } else if let Some(challenge) = challenge {
+            Unauthorized {
+                msg,
+                challenge: challenge.to_owned(),
+            }
+            .into()
         } else {
             anyhow::anyhow!(msg)
         },
@@ -391,6 +406,29 @@ impl std::fmt::Display for Missing {
 
 impl std::error::Error for Missing {}
 
+/// A 401 with the `WWW-Authenticate` header that says how to authenticate.
+#[derive(Debug)]
+struct Unauthorized {
+    msg: String,
+    challenge: String,
+}
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for Unauthorized {}
+
+/// The `WWW-Authenticate` header of a 401 that `e` reports.
+pub fn challenge(e: &anyhow::Error) -> Option<&str> {
+    (e.chain()).find_map(|e| {
+        e.downcast_ref::<Unauthorized>()
+            .map(|u| u.challenge.as_str())
+    })
+}
+
 /// Whether `e` is a request that couldn't connect, or failed its TLS
 /// handshake.
 pub fn failed_to_connect(e: &anyhow::Error) -> bool {
@@ -457,7 +495,7 @@ pub fn broke_off(e: &anyhow::Error) -> bool {
     })
 }
 
-fn client() -> anyhow::Result<reqwest::Client> {
+pub fn client() -> anyhow::Result<reqwest::Client> {
     // reqwest loads the system root certificates, so `SSL_CERT_FILE` and
     // `SSL_CERT_DIR` work.
     reqwest::Client::builder()
@@ -522,8 +560,8 @@ impl Transport {
     }
 
     /// The repository of an OCI registry at `base`, like
-    /// `https://host/v2/<name>/`.
-    pub fn registry(base: &Url) -> anyhow::Result<Self> {
+    /// `https://host/v2/<name>/`, read with `credentials`.
+    pub fn registry(base: &Url, credentials: Arc<Credentials>) -> anyhow::Result<Self> {
         ensure!(
             matches!(base.scheme(), "http" | "https"),
             "a registry needs http(s)://"
@@ -531,7 +569,7 @@ impl Transport {
         Ok(Self::Http(Http {
             base: redact(base),
             client: client()?,
-            auth: None,
+            auth: Some(Auth::Registry(credentials)),
         }))
     }
 

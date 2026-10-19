@@ -3,6 +3,7 @@
 //! store path in the closure: the path's NAR, with the rest of its narinfo as
 //! annotations. [`docs/OCI.md`](../../../docs/OCI.md) describes the format.
 
+mod auth;
 #[cfg(test)]
 pub(crate) mod test_registry;
 
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufRead;
 use url::Url;
 
+pub use self::auth::Credentials;
 use crate::narinfo::{Compression, NarInfo};
 use crate::store_path;
 use crate::transport::{self, Transport};
@@ -77,9 +79,28 @@ pub struct Repository {
     /// that each repository doesn't add a series.
     pub host: Url,
     transport: Transport,
+    credentials: Arc<Credentials>,
 }
 
 impl Repository {
+    /// Runs `op`, and runs it again if the registry answered with a challenge
+    /// that the credentials could answer, like a token that expired.
+    async fn authorized<T, F, Fut>(&self, op: F) -> anyhow::Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
+        let e = match op().await {
+            Err(e) => e,
+            ok => return ok,
+        };
+        let Some(challenge) = transport::challenge(&e).map(str::to_owned) else {
+            return Err(e);
+        };
+        (self.credentials.answer(&challenge).await).with_context(|| format!("{e:#}"))?;
+        op().await
+    }
+
     /// A reader for the blob at `path`, like `blobs/sha256:<digest>`, which
     /// holds a NAR with `compression`.
     pub async fn stream(
@@ -87,7 +108,8 @@ impl Repository {
         path: &str,
         compression: Compression,
     ) -> anyhow::Result<Box<dyn AsyncBufRead + Send + Unpin>> {
-        self.transport.stream(path, compression).await
+        self.authorized(|| self.transport.stream(path, compression))
+            .await
     }
 }
 
@@ -210,11 +232,17 @@ impl Registries {
         Ok(base)
     }
 
-    fn repository(host: &str, name: &str, base: &Url) -> anyhow::Result<Repository> {
+    fn repository(&self, host: &str, name: &str, base: &Url) -> anyhow::Result<Repository> {
+        let credentials = Arc::new(Credentials::new(
+            host,
+            format!("repository:{name}:pull"),
+            self.insecure.clone(),
+        ));
         Ok(Repository {
             name: Url::parse(&format!("oci://{host}/{name}"))?,
             host: Url::parse(&format!("oci://{host}"))?,
-            transport: Transport::registry(base)?,
+            transport: Transport::registry(base, credentials.clone())?,
+            credentials,
         })
     }
 
@@ -272,9 +300,13 @@ impl Registries {
         system: &str,
         store_dir: &StoreDir,
     ) -> anyhow::Result<Artifact> {
-        let repository = Self::repository(&reference.host, &reference.name, &reference.base)?;
-        let pinned = (get_document(&repository.transport, &reference.digest).await)
-            .map_err(|e| hint(&reference.base, e))?;
+        let repository = self.repository(&reference.host, &reference.name, &reference.base)?;
+        let get = |digest: &str| {
+            let digest = digest.to_owned();
+            let repository = &repository;
+            async move { (repository.authorized(|| get_document(&repository.transport, &digest))).await }
+        };
+        let pinned = (get(&reference.digest).await).map_err(|e| hint(&reference.base, e))?;
         let manifest = match kind(&pinned)? {
             Kind::Manifest => pinned.1,
             Kind::Index => {
@@ -295,7 +327,7 @@ impl Registries {
                     entry.media_type
                 );
                 check_digest(&entry.digest)?;
-                let child = get_document(&repository.transport, &entry.digest).await?;
+                let child = get(&entry.digest).await?;
                 ensure!(
                     matches!(kind(&child)?, Kind::Manifest),
                     "the index's manifest for linux/{arch} isn't a manifest"
@@ -318,7 +350,8 @@ impl Registries {
             "the manifest's config is a {}, not a {CONFIG_TYPE}",
             config.media_type
         );
-        let config = get_blob(&repository.transport, config, MAX_CONFIG).await?;
+        let config =
+            (repository.authorized(|| get_blob(&repository.transport, config, MAX_CONFIG))).await?;
         let config: Config = serde_json::from_slice(&config).context("parsing the config")?;
         ensure!(
             config.store_dir == store_dir.to_str(),
@@ -593,7 +626,7 @@ pub(crate) mod tests {
     use serde_json::{Value, json};
     use tokio::io::AsyncReadExt;
 
-    use super::test_registry::Registry;
+    use super::test_registry::{Login, Registry};
     use super::*;
     use crate::narinfo::tests::{file_nar, sign};
 
@@ -967,7 +1000,7 @@ pub(crate) mod tests {
         let key = key();
         let system = "aarch64-linux";
         for compression in [Compression::None, Compression::Zstd, Compression::Xz] {
-            let registry = Registry::start().await;
+            let registry = Registry::start(Login::None).await;
             let reference = put_closure(&registry, &[system], compression, &key).await;
             let tag = registry
                 .get(&format!("/v2/{NAME}/manifests/latest"))
@@ -1010,7 +1043,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reads_an_index_for_two_systems() {
         let key = key();
-        let registry = Registry::start().await;
+        let registry = Registry::start(Login::None).await;
         let systems = ["x86_64-linux", "aarch64-linux"];
         let reference = put_closure(&registry, &systems, Compression::Zstd, &key).await;
         let digest = reference.rsplit_once('@').unwrap().1;
@@ -1038,11 +1071,33 @@ pub(crate) mod tests {
         }
     }
 
+    /// Registries ask for a token even for public repositories, and the
+    /// token service gives anyone one.
+    #[tokio::test]
+    async fn gets_anonymous_tokens() {
+        let system = "aarch64-linux";
+        let registry = Registry::start(Login::Token).await;
+        let reference = put_closure(&registry, &[system], Compression::None, &key()).await;
+        let artifact = fetch(&registries(&registry), &reference, system)
+            .await
+            .unwrap();
+        // NAR fetches use the token too.
+        let mut nar = Vec::new();
+        let url = artifact.layers[0].url();
+        let mut stream = (artifact.repository)
+            .stream(url, Compression::None)
+            .await
+            .unwrap();
+        stream.read_to_end(&mut nar).await.unwrap();
+        assert!(!nar.is_empty());
+        assert_eq!(registry.requests("/token").len(), 1, "{:?}", registry.log);
+    }
+
     #[tokio::test]
     async fn rejects_wrong_digests() {
         let key = key();
         let system = "aarch64-linux";
-        let registry = Registry::start().await;
+        let registry = Registry::start(Login::None).await;
         let reference = put_closure(&registry, &[system], Compression::None, &key).await;
         let digest = reference.rsplit_once('@').unwrap().1;
         let registries = registries(&registry);
@@ -1176,7 +1231,7 @@ pub(crate) mod tests {
             }),
         ];
         for (compression, want, edit) in cases {
-            let registry = Registry::start().await;
+            let registry = Registry::start(Login::None).await;
             let reference = put_closure(&registry, &[system], compression, &key).await;
             let reference = edit_manifest(&registry, &reference, edit);
             let msg = fetch_err(&registries(&registry), &reference, system).await;
@@ -1184,7 +1239,7 @@ pub(crate) mod tests {
         }
 
         // The artifact must be for this node's system.
-        let registry = Registry::start().await;
+        let registry = Registry::start(Login::None).await;
         let reference = put_closure(&registry, &["x86_64-linux"], Compression::None, &key).await;
         let msg = fetch_err(&registries(&registry), &reference, system).await;
         assert!(
@@ -1198,7 +1253,7 @@ pub(crate) mod tests {
     /// checks the URL it goes to.
     #[tokio::test]
     async fn refuses_plain_http_unless_allowed() {
-        let registry = Registry::start().await;
+        let registry = Registry::start(Login::None).await;
         let reference = put_closure(&registry, &["aarch64-linux"], Compression::None, &key()).await;
         let secure = Registries::new(vec![registry.host.clone()], Vec::new());
         let secure = secure.parse(&reference).unwrap();

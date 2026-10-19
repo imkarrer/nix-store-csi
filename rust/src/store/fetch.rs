@@ -1226,10 +1226,10 @@ mod tests {
 
     #[tokio::test]
     async fn ensures_an_artifact() {
-        use oci::test_registry::Registry;
+        use oci::test_registry::{Login, Registry};
         let key = oci::tests::key();
         let system = store_path::system();
-        let registry = Registry::start().await;
+        let registry = Registry::start(Login::None).await;
         let reference =
             oci::tests::put_closure(&registry, &[&system], Compression::Zstd, &key).await;
         let (tmp, cache) = (scratch(), crate::narinfo::tests::empty_cache());
@@ -1264,11 +1264,11 @@ mod tests {
 
     #[tokio::test]
     async fn needs_trusted_signatures_on_artifacts() {
-        use oci::test_registry::Registry;
+        use oci::test_registry::{Login, Registry};
         let (trusted, other) = (oci::tests::key(), oci::tests::key());
         let system = store_path::system();
         let cache = crate::narinfo::tests::empty_cache();
-        let registry = Registry::start().await;
+        let registry = Registry::start(Login::None).await;
         let signed =
             oci::tests::put_closure(&registry, &[&system], Compression::None, &trusted).await;
         let by_other =
@@ -1306,13 +1306,13 @@ mod tests {
     /// falls back only to a cache with the same `NarHash`.
     #[tokio::test]
     async fn checks_nars_from_artifacts() {
-        use oci::test_registry::Registry;
+        use oci::test_registry::{Login, Registry};
         let key = oci::tests::key();
         let system = store_path::system();
         let objects = oci::tests::objects(&system);
         let shared = &objects[0];
         for compression in [Compression::None, Compression::Zstd] {
-            let registry = Registry::start().await;
+            let registry = Registry::start(Login::None).await;
             let reference = oci::tests::put_closure(&registry, &[&system], compression, &key).await;
             // The registry serves other bytes for `shared`'s layer.
             let evil = oci::tests::compress(&file_nar(b"evil!!"), compression).await;
